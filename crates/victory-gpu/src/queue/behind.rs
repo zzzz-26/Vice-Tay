@@ -822,6 +822,22 @@ pub(super) fn drain() {
     STATS[DRAINS].fetch_add(1, Relaxed);
 }
 
+/// On the upscaler's thread, wait for any prior Present to consume its
+/// frame-generation buffers. A blocked title queue can still make progress.
+pub(super) fn wait_before_framegen() {
+    if OURS.get() {
+        return;
+    }
+    let state = LANE.lock();
+    let (_state, wait) = LANE
+        .moved
+        .wait_timeout_while(state, Duration::from_millis(250), |state| state.presents != 0)
+        .unwrap_or_else(|e| e.into_inner());
+    if wait.timed_out() {
+        tracing::debug!(target: "victory_gpu::framegen", "frame generation: previous present still pending at upscale");
+    }
+}
+
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
     let queue = this as usize;

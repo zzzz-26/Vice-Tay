@@ -15,6 +15,12 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// On Windows with diagnostics, copystat counts allocations and uses this
+// same backend when the feature is enabled.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
@@ -39,8 +45,12 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod framegen;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]

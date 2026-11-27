@@ -596,13 +596,23 @@ mod tests {
     /// and the pointer, the scratch register and the flags come out as from the loop.
     #[test]
     fn a_clzero_loop_becomes_plain_stores() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // The native loop test can initialise the shared stub bank first.
+        // Reserve the fixture within reach of that bank on either CPU.
+        let stub_base = {
+            let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+            stubs
+                .get_or_insert_with(|| {
+                    let anchor = a_clzero_loop_becomes_plain_stores as *const () as usize;
+                    (near(anchor).expect("CLZERO stub storage near the test image"), 0)
+                })
+                .0
+        };
         // Against rdx (rm rax, reg rdx) and against rcx, the scratch register.
         for (cmp, by) in [([0x48, 0x39, 0xd0], 2), ([0x48, 0x39, 0xc8], 1), ([0x4c, 0x39, 0xc0], 8)] {
             // SAFETY: memory of our own, written and run inside it.
             unsafe {
-                let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
-                assert_ne!(page, 0);
+                let page = near(stub_base).expect("CLZERO test loop within jump range");
                 // A function of (start, end): the start in rax, the end in its register, the
                 // loop at 16, and what rax became.
                 let mut head = vec![0x48, 0x89, 0xc8]; // mov rax, rcx

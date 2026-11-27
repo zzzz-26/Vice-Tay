@@ -5,6 +5,20 @@ layer sends to the card, and the memory it reads) and run it again without
 the title, to see where the card's time goes and to try changes in seconds.
 Code: `crates/victory-gpu/src/replay`.
 
+## Inspect a dropped draw
+
+For one frame's operation listing, create the capture folder first. Use a
+diagnostics build and add the folder and frame number to your usual launch.
+
+```powershell
+-More @{VICTORY_CAPTURE='C:\captures\vice-tay'; VICTORY_CAPTURE_FRAMES='1000'}
+```
+
+Read `frame-1000-ops.txt` in the capture folder. A failed preparation for a
+direct draw, indexed draw or mesh dispatch includes the reason, pipeline
+recipe key and guest shader hashes when a pipeline was set. Draws that reach
+the GPU can still produce incorrect geometry, depth or materials.
+
 ## Recording
 
 Off unless `VICTORY_RECORD` is set. Build with

@@ -163,6 +163,28 @@ fork's constant.
 
 It is off while the builder runs.
 
+### Limit reflection brightness with the builder off
+
+`VICTORY_AMBIENT_REFLECT` caps reflection brightness at a multiple of the
+ambient estimate and preserves hue. For a comparison with ray tracing off,
+keep the usual launcher settings and add `-More $reflectionHold`.
+
+```powershell
+$reflectionHold = @{
+    VICTORY_AMBIENT = '0.8'
+    VICTORY_AMBIENT_REFLECT = '1'
+    VICTORY_AMBIENT_REFLECT_IN = 'CS_TemporalResolve2_Opaque,CS_TemporalResolve1_Alpha'
+}
+```
+
+The two names are case-sensitive shader name prefixes for the opaque and
+alpha resolves. The `held=1` startup message confirms the option was parsed.
+Look for `the reflection hold is enabled` and a nonzero `direct` or
+`indirect_gated` count in the resolve summary to confirm a hold was recorded.
+The counters also report direct dispatches with zero groups, counted indirect
+dispatches and indirect dispatches with multiple records.
+[Original reflection hold](https://github.com/avatarmanz/VIctory-7900XTX/pull/314)
+
 ## Where to look
 
 - `crates/victory-shader/src/bvh.rs`: the reference for the node test.

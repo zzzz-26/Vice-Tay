@@ -377,6 +377,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             // after the release another allocation may take the address, and
             // a guard left over (or a protection change made later) would hit
             // memory not ours.
+            let _changing = victory_gpu::title_memory_remapping();
             victory_gpu::title_memory_freed(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
@@ -1997,7 +1998,8 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
-    // Splitting and joining placeholders changes nothing they show.
+    // Returning a private allocation to its placeholder can remove live pages.
+    let _changing = victory_gpu::title_memory_remapping();
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
     }

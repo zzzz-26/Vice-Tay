@@ -648,6 +648,7 @@ pub(crate) unsafe fn texture(
     device: &ID3D12Device,
     desc: *const D3D12_RESOURCE_DESC,
     state: D3D12_RESOURCE_STATES,
+    first_attempt: bool,
 ) -> Option<ID3D12Resource> {
     if !on() {
         return None;
@@ -678,7 +679,11 @@ pub(crate) unsafe fn texture(
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
+            // The pool still backs off its own growth when this is the
+            // texture's last attempt, without renewing the global pause.
+            if first_attempt {
+                crate::residency::allocation_error(&e);
+            }
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
@@ -911,7 +916,7 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: a valid description.
-        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
+        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, true) }) else { return };
         assert_eq!(crate::host::references(&t), 1, "what the texture holds is no reference to it");
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();

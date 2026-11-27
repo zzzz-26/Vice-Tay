@@ -1,5 +1,27 @@
 # Measurements
 
+## Series S frame generation
+
+On November 27, 2026, I measured a boat traversal on the RTX 4090 and Ryzen 9
+9950X3D. The Series S diagnostics build was `88e80129`, based on `d945e99c`
+with the current test patches. DLSS Quality scaled 1280×720 to 1920×1080, and
+AMD FSR 3.1.6 frame generation was set to 2×. The frame rate was unlocked,
+with the performance overlay on and capture running at up to 60 FPS.
+
+The sample contains 356 intervals over 364 seconds of piloting. It excludes
+the checkpoint transition.
+
+| FPS measure | Median | 10th percentile |
+|---|---:|---:|
+| Rendered | 22.4 | 20.0 |
+| Presented, including generated frames | 44.9 | 40.3 |
+
+Frame generation added a median of 22.4 FPS. The swap chain presented 2.00×
+as many frames as the renderer produced across the sample. The output
+reached 30 FPS in 355 of the 356 intervals.
+
+## Series S baseline
+
 Build bc090416, 2026-11-26 (`cargo build --profile diag -p victory --features diagnostics`).
 On the test PC the README describes, with `scripts\play.ps1 -Console series-s`
 and the RTX 4090 settings, in full screen, played by hand: the prologue from the

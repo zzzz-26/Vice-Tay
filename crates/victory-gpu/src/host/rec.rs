@@ -51,6 +51,17 @@ impl Rec {
         Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
     }
 
+    /// Closes an unused recording for reset without emitting held barriers.
+    ///
+    /// # Safety
+    /// The caller owns the recording. The list is open and will not be submitted.
+    pub(super) unsafe fn close_discarded(&self) -> windows::core::Result<()> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).0.clear();
+        self.any.store(false, Relaxed);
+        // SAFETY: the caller's open, unsubmitted list.
+        unsafe { self.list.Close() }
+    }
+
     /// Records `barriers` now, or holds them for the next use of the list.
     ///
     /// # Safety

@@ -109,3 +109,38 @@ the preset, a longer acceleration toward the shore averaged 17.60 FPS over
 33.06 seconds and one interval dropped to 3.51 FPS. The boats reached different
 positions during the longer run. Sustained 20 FPS through shoreline streaming
 and longer-session behavior still need validation.
+
+## Series S check on an RTX 3080 10 GB (2026-11-27)
+
+An RTX 3080 10 GB (driver 610.88, Windows 11 26200), Core i5-13600K
+(6 performance and 8 efficient cores, 20 threads), and 32 GB of RAM ran the
+Series S profile from `0ef44bc`, diagnostics build, full screen, default output
+resolution, in the prison cell: the character standing at the window.
+
+**Matched pair.** Each run started from a fresh copy of the same warmed cache
+(translated shaders, host pipeline library) and of the same save, with
+`-Machine` the only difference. FPS is from the last 18 frame summaries in the world
+(about 90 s, 4,200 to 4,350 draws a frame).
+
+| `-Machine` | FPS median | lowest | ms a frame | preparing | on the GPU | copying back | Peak VRAM | GPU busy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4090 | 7.4 | 7.0 | 135 | 56 | 63 | 50 | 5.8 GB | 87 % |
+| 4070 | **14.7** | 14.2 | 68 | 50 | 2 | 32 | 7.3 GB | 74 % |
+
+With the 4090 profile the card is busy most of the frame but runs at 7 fps,
+most likely reading title buffers that profile leaves in system memory over
+PCIe. The 4070 profile keeps buffers on the card (64 KiB minimum, 1,536 MiB
+budget). That fits in 10 GB here and leaves the CPU side as the limit.
+
+**Earlier single runs (same build, not matched):** `-Machine 4070` with
+`VICTORY_D3D12_DRED=0` and `VICTORY_OUTPUT=1920x1080` ran 15.2 fps (p10
+14.2). Adding `VICTORY_PLACED_ORDER=1` ran 14.6 (p10 10.7): no gain here.
+
+**Open world** (one run, an open-world save, `-Machine 4070`, DRED off, 1080p
+output, about 4 min standing and walking):
+- Median 11.4 fps (p10 8.7).
+- By draw count: 13 to 14.7 fps at about 6,000 draws, 11 to 12 at 9,400, and
+  9 to 10.5 at 12,200. The views change because the idle camera turns.
+- Peak VRAM 6.8 GB of 10. No device lost.
+- The texture queue held 4,000 to 29,000 slots. Most of them waited for their
+  memory (21,264 of 27,116 at the peak), with no pass short of room.

@@ -516,6 +516,7 @@ fn translate(
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
+    tracing::debug!(shader_hash = %hash, "reading offline shader container");
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
@@ -562,7 +563,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, programs, &hash, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -575,7 +576,14 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    hash: &str,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -639,11 +647,12 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
+                    tracing::debug!(shader_hash = %hash, stage = ?p.stage, "emitting offline DXIL");
                     match emit::emit_with_retries(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            check(shader, t, checks, hash, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -714,6 +723,7 @@ fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
     checks: &mut Checks,
+    hash: &str,
     label: impl Fn() -> String,
 ) {
     if let Some(keep) = &checks.keep {
@@ -739,6 +749,7 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        tracing::debug!(shader_hash = %hash, stage = ?shader.stage, "creating offline D3D12 pipeline");
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
@@ -761,6 +772,7 @@ fn check(
         }
         return;
     };
+    tracing::debug!(shader_hash = %hash, stage = ?shader.stage, "validating offline DXIL");
     match v.validate(&mut shader.dxil) {
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;

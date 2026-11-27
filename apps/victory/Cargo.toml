@@ -33,6 +33,7 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true

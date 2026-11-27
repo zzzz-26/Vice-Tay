@@ -713,7 +713,7 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: a valid description.
-        let texture = unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) };
+        let texture = unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, true) };
         if let Some(texture) = texture {
             let at = texture_address(&texture, &desc);
             println!("address {at:x?}");

@@ -19,23 +19,28 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
+pub(crate) const UPLOAD_RETRY_MS: u64 = 500;
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
-        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
+        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(UPLOAD_RETRY_MS), Ordering::Relaxed);
     }
 }
 
 thread_local! {
-    static STAGING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UPLOAD_DEFERRALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-pub(crate) fn note_staging_deferred() {
-    STAGING_DEFERRED.set(true);
+pub(crate) fn note_upload_deferred() {
+    UPLOAD_DEFERRALS.set(UPLOAD_DEFERRALS.get().wrapping_add(1));
 }
 
-pub(crate) fn take_staging_deferred() -> bool {
-    STAGING_DEFERRED.replace(false)
+/// Detects upload deferral during this operation. Nested checks can observe
+/// the same deferral without consuming the enclosing operation's signal.
+pub(crate) fn upload_deferred_during<T>(work: impl FnOnce() -> T) -> (T, bool) {
+    let before = UPLOAD_DEFERRALS.get();
+    let result = work();
+    (result, UPLOAD_DEFERRALS.get() != before)
 }
 
 pub(crate) fn upload_refused() -> bool {
@@ -62,11 +67,11 @@ fn has_upload_reserve(commit: u64, bake: bool) -> bool {
     commit >= if bake { 256 * MIB } else { 512 * MIB }
 }
 
-fn has_growth_reserve(commit: u64, bake: bool) -> bool {
+fn has_growth_reserve(commit: u64, bytes: u64, bake: bool) -> bool {
     // Growing a fresh 64 MiB upload block for speculative bindless prefetch
     // requires more headroom than reusing slices already committed inside the
     // staging pool.
-    commit >= if bake { 256 * MIB } else { 1024 * MIB }
+    commit.saturating_sub(bytes) >= if bake { 256 * MIB } else { 1024 * MIB }
 }
 
 /// Leave commit for game allocations and submissions already in flight while
@@ -83,11 +88,21 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
 /// (reusing existing free ranges in already-committed pool blocks stays open
 /// whenever `admit_texture_pass` is true).
 pub(crate) fn allow_staging_growth(bake: bool) -> bool {
+    allow_growth(0, bake)
+}
+
+/// Whether a second CPU-backed buffer can fit while leaving the existing
+/// growth reserve for streaming and submissions.
+pub(crate) fn allow_optional_buffer_growth(bytes: u64) -> bool {
+    allow_growth(bytes, false)
+}
+
+fn allow_growth(bytes: u64, bake: bool) -> bool {
     let now = crate::host::coarse_ms();
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    has_growth_reserve(sample_commit(now), bytes, bake)
 }
 
 /// A PC with 32 GiB of RAM or less, or `VICTORY_RESIDENCY_LIMITED=1` (the
@@ -168,6 +183,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_upload_deferral_reaches_the_enclosing_operation() {
+        note_upload_deferred();
+        assert!(!upload_deferred_during(|| ()).1);
+        let (_, deferred) = upload_deferred_during(|| {
+            assert!(upload_deferred_during(note_upload_deferred).1);
+            assert!(!upload_deferred_during(|| ()).1);
+        });
+        assert!(deferred);
+    }
+
+    #[test]
     fn bake_and_lookahead_leave_room_for_live_game_allocations() {
         for (commit, bake, lookahead, growth) in [
             (128 * MIB, false, false, false),
@@ -178,8 +204,15 @@ mod tests {
         ] {
             assert_eq!(has_upload_reserve(commit, true), bake);
             assert_eq!(has_upload_reserve(commit, false), lookahead);
-            assert_eq!(has_growth_reserve(commit, false), growth);
+            assert_eq!(has_growth_reserve(commit, 0, false), growth);
         }
+    }
+
+    #[test]
+    fn a_second_buffer_counts_against_the_growth_reserve() {
+        assert!(!has_growth_reserve(GIB, 64 * MIB, false));
+        assert!(has_growth_reserve(GIB + 64 * MIB, 64 * MIB, false));
+        assert!(!has_growth_reserve(512 * MIB, GIB, false));
     }
 
     #[test]

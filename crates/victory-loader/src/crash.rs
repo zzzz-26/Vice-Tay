@@ -17,14 +17,14 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, ReadProcessMemory,
+    RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadStackLimits};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -654,6 +654,269 @@ fn unwind(context: CONTEXT) -> Vec<u64> {
 #[repr(C, align(16))]
 pub(crate) struct Aligned16(pub(crate) CONTEXT);
 
+/// A four-byte header, at most 255 unwind slots plus alignment padding,
+/// and an optional chained function entry.
+const MAX_UNWIND_INFO: usize = 4 + 2 * 256 + 12;
+
+#[derive(Debug, PartialEq, Eq)]
+struct Reach {
+    /// Furthest stack read from RSP or the established frame, including
+    /// restores relative to the original frame base.
+    bytes: u64,
+    frame: Option<(u8, u8)>,
+}
+
+fn nonvolatile(reg: u8) -> bool {
+    matches!(reg, 3 | 5..=7 | 12..=15)
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Bounds the unwind's stack accesses before asking Windows to perform it.
+/// The chain callback fills fixed scratch storage because the sampled
+/// thread may hold the allocator lock.
+fn reach_of(
+    info: &[u8],
+    in_prolog: Option<u32>,
+    mut chained: impl FnMut(u32, &mut [u8; MAX_UNWIND_INFO]) -> Option<usize>,
+) -> Option<Reach> {
+    let mut scratch = [0; MAX_UNWIND_INFO];
+    let mut chain_len = None;
+    let mut stack_bytes = 8u64;
+    let mut saved_end = 0;
+    let mut frame = None;
+    let mut frame_spec = None;
+    let mut restores = 0u16;
+    for depth in 0..8 {
+        let info = match chain_len {
+            Some(length) => scratch.get(..length)?,
+            None => info,
+        };
+        let [head, _, count, frame_byte] = *info.first_chunk::<4>()?;
+        let (version, flags) = (head & 7, head >> 3);
+        if !matches!(version, 1 | 2) || flags & !7 != 0 || flags & 4 != 0 && flags & 3 != 0 {
+            return None;
+        }
+        let register = frame_byte & 0xf;
+        let frame_offset = frame_byte >> 4;
+        if register == 0 && frame_offset != 0 || register != 0 && !nonvolatile(register) {
+            return None;
+        }
+        if depth == 0 {
+            frame_spec = Some(frame_byte);
+            if register != 0 && in_prolog.is_none() {
+                frame = Some((register, frame_offset));
+            }
+        } else if frame_spec != Some(frame_byte) {
+            return None;
+        }
+        let count = usize::from(count);
+        let codes = info.get(4..4 + 2 * count)?;
+        let slot = |i: usize| {
+            let pair: [u8; 2] = codes.get(2 * i..2 * i + 2)?.try_into().ok()?;
+            Some(u16::from_le_bytes(pair))
+        };
+        let long = |i| Some(u64::from(read_u32(codes, 2 * i)?));
+        let mut i = 0;
+        let mut epilog_prefix = true;
+        while i < count {
+            let op = slot(i)?;
+            let offset = u32::from(op & 0xff);
+            let opcode = (op >> 8) & 0xf;
+            let reg = (op >> 12) as u8;
+            let active = depth != 0 || in_prolog.is_none_or(|at| offset <= at);
+            let mut restored = None;
+            let (slots, stack, saved) = match opcode {
+                0 if nonvolatile(reg) => {
+                    restored = Some(reg);
+                    (1, 8, 0)
+                }
+                1 if reg == 0 => (2, u64::from(slot(i + 1)?) * 8, 0),
+                1 if reg == 1 => (3, long(i + 1)?, 0),
+                2 => (1, u64::from(reg) * 8 + 8, 0),
+                3 if reg == 0 && register != 0 => {
+                    if active {
+                        if restores & (1 << register) != 0 {
+                            return None;
+                        }
+                        frame = Some((register, frame_offset));
+                    }
+                    (1, 0, 0)
+                }
+                4 if nonvolatile(reg) => {
+                    restored = Some(reg);
+                    (2, 0, u64::from(slot(i + 1)?) * 8 + 8)
+                }
+                5 if nonvolatile(reg) => {
+                    restored = Some(reg);
+                    (3, 0, long(i + 1)? + 8)
+                }
+                // V2 epilog entries precede the prolog operations in pairs.
+                6 if version == 2 && epilog_prefix && (slot(i + 1)? >> 8) & 0xf == 6 => (2, 0, 0),
+                8 if reg >= 6 => (2, 0, u64::from(slot(i + 1)?) * 16 + 16),
+                9 if reg >= 6 => (3, 0, long(i + 1)? + 16),
+                10 if reg <= 1 && flags & 4 == 0 && i + 1 == count => {
+                    (1, 40 + 8 * u64::from(reg), 0)
+                }
+                _ => return None,
+            };
+            epilog_prefix &= opcode == 6;
+            if active {
+                stack_bytes = stack_bytes.checked_add(stack)?;
+                saved_end = saved_end.max(saved);
+                if let Some(register) = restored {
+                    restores |= 1 << register;
+                }
+            }
+            i += slots;
+        }
+        if flags & 4 == 0 {
+            return Some(Reach {
+                bytes: stack_bytes.max(saved_end),
+                frame,
+            });
+        }
+        let at = 4 + 2 * (count + count % 2) + 8;
+        let rva = read_u32(info, at)?;
+        chain_len = Some(chained(rva, &mut scratch)?);
+    }
+    None
+}
+
+fn readable(address: u64, bytes: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        VirtualQuery,
+    };
+
+    let Some(end) = address.checked_add(bytes) else {
+        return false;
+    };
+    let mut at = address;
+    while at < end {
+        // SAFETY: the query only reads the address space's bookkeeping.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if size == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & PAGE_GUARD != 0
+            || !matches!(
+                info.Protect & 0xff,
+                PAGE_READONLY
+                    | PAGE_READWRITE
+                    | PAGE_WRITECOPY
+                    | PAGE_EXECUTE_READ
+                    | PAGE_EXECUTE_READWRITE
+                    | PAGE_EXECUTE_WRITECOPY
+            )
+        {
+            return false;
+        }
+        let Some(next) = (info.BaseAddress as u64).checked_add(info.RegionSize as u64) else {
+            return false;
+        };
+        if next <= at {
+            return false;
+        }
+        at = next;
+    }
+    true
+}
+
+/// Copies at most the caller's fixed buffer size, using the kernel to
+/// report a failed read if a module is unmapped between checks.
+fn read_memory(address: u64, out: &mut [u8]) -> bool {
+    if !readable(address, out.len() as u64) {
+        return false;
+    }
+    let mut read = 0;
+    // SAFETY: the output is an exclusive writable buffer of the stated
+    // size. ReadProcessMemory validates the source in the current process.
+    unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            &mut read,
+        ) != 0
+            && read == out.len()
+    }
+}
+
+fn read_unwind_info(image: u64, rva: u32, scratch: &mut [u8; MAX_UNWIND_INFO]) -> Option<usize> {
+    let address = image.checked_add(u64::from(rva))?;
+    if address % 4 != 0 {
+        return None;
+    }
+    let mut header = [0; 4];
+    if !read_memory(address, &mut header) {
+        return None;
+    }
+    let flags = header[0] >> 3;
+    let slots = usize::from(header[2]).next_multiple_of(2);
+    let trailer = if flags & 4 != 0 {
+        12
+    } else if flags & 3 != 0 {
+        4
+    } else {
+        0
+    };
+    let len = 4 + 2 * slots + trailer;
+    let bytes = scratch.get_mut(..len)?;
+    (read_memory(address, bytes) && bytes.starts_with(&header)).then_some(len)
+}
+
+/// Checks the known read range from both the current stack pointer and
+/// the established frame, if present. This also covers a partially
+/// unwound epilog, where RSP may be ahead of the base.
+fn frame_is_readable(image: u64, entry: u64, context: &CONTEXT, low: u64, high: u64) -> bool {
+    fn range(image: u64, entry: u64, context: &CONTEXT) -> Option<(u64, u64)> {
+        let mut entry_bytes = [0; 12];
+        if !read_memory(entry, &mut entry_bytes) {
+            return None;
+        }
+        let pc = context.Rip.checked_sub(image)?;
+        let start = u64::from(read_u32(&entry_bytes, 0)?);
+        let end = u64::from(read_u32(&entry_bytes, 4)?);
+        if !(start..end).contains(&pc) {
+            return None;
+        }
+        let mut info = [0; MAX_UNWIND_INFO];
+        let len = read_unwind_info(image, read_u32(&entry_bytes, 8)?, &mut info)?;
+        let into = pc - start;
+        let in_prolog = (into < u64::from(info[1])).then_some(into as u32);
+        let reach = reach_of(&info[..len], in_prolog, |rva, scratch| {
+            read_unwind_info(image, rva, scratch)
+        })?;
+        let base = if let Some((register, offset)) = reach.frame {
+            let value = match register {
+                3 => context.Rbx,
+                5 => context.Rbp,
+                6 => context.Rsi,
+                7 => context.Rdi,
+                12 => context.R12,
+                13 => context.R13,
+                14 => context.R14,
+                15 => context.R15,
+                _ => return None,
+            };
+            value.checked_sub(16 * u64::from(offset))?
+        } else {
+            context.Rsp
+        };
+        let start = base.min(context.Rsp);
+        let end = base.max(context.Rsp).checked_add(reach.bytes)?;
+        Some((start, end))
+    }
+
+    range(image, entry, context)
+        .is_some_and(|(start, end)| start >= low && end <= high && readable(start, end - start))
+}
+
 /// [`unwind`] for any thread of the process, its stack being `low..high`;
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
@@ -663,21 +926,33 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
     // the stack can land 8 bytes off and fault (seen in a debug build).
     let mut aligned = Aligned16(context);
     let context = &mut aligned.0;
+    let limit = MAX_FRAMES.min(frames.capacity());
+    if frames.len() >= limit {
+        return;
+    }
     frames.push(context.Rip);
-    while frames.len() < MAX_FRAMES {
-        // Stop where reading the stack would fault inside this handler.
-        let rsp = context.Rsp as usize;
-        if rsp < low || rsp + 8 > high {
+    while frames.len() < limit {
+        let rsp = context.Rsp;
+        let Some(next_rsp) = rsp.checked_add(8) else {
+            break;
+        };
+        if rsp < low as u64 || next_rsp > high as u64 {
             break;
         }
         let mut image = 0;
         // SAFETY: looks up the function table entry covering `Rip`, if any.
         let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
         if entry.is_null() {
-            // SAFETY: `rsp` is inside this thread's stack.
-            context.Rip = unsafe { (rsp as *const u64).read() };
-            context.Rsp += 8;
+            let mut return_address = [0; 8];
+            if !read_memory(rsp, &mut return_address) {
+                break;
+            }
+            context.Rip = u64::from_le_bytes(return_address);
+            context.Rsp = next_rsp;
         } else {
+            if !frame_is_readable(image, entry as u64, context, low as u64, high as u64) {
+                break;
+            }
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
             unsafe {
@@ -797,6 +1072,178 @@ mod tests {
         // SAFETY: a non-null entry belongs to `image`, which the lookup wrote,
         // and `BeginAddress` is an offset into that image.
         Some(image + u64::from(unsafe { (*entry).BeginAddress }))
+    }
+
+    /// `push rbp; sub rsp, 0x28`: the return address, the push, the frame.
+    const PLAIN: [u8; 8] = [0x01, 5, 2, 0x00, 0x05, 0x42, 0x01, 0x50];
+    /// `push rbp; mov rbp, rsp; sub rsp, 0x20`, rbp the frame register.
+    const FRAMED: [u8; 10] = [0x01, 8, 3, 0x05, 0x08, 0x32, 0x04, 0x03, 0x01, 0x50];
+
+    fn none(_: u32, _: &mut [u8; MAX_UNWIND_INFO]) -> Option<usize> {
+        None
+    }
+
+    #[test]
+    fn reach_counts_pushes_allocations_and_the_return_address() {
+        assert_eq!(
+            reach_of(&PLAIN, None, none),
+            Some(Reach {
+                bytes: 8 + 8 + 0x28,
+                frame: None
+            })
+        );
+        // `sub rsp, 0x2000` as a large allocation in eighths.
+        let large = [0x01, 7, 2, 0x00, 0x07, 0x01, 0x00, 0x04];
+        assert_eq!(
+            reach_of(&large, None, none),
+            Some(Reach {
+                bytes: 8 + 0x2000,
+                frame: None
+            })
+        );
+    }
+
+    #[test]
+    fn reach_takes_the_frame_register_once_the_prolog_set_it() {
+        assert_eq!(
+            reach_of(&FRAMED, None, none),
+            Some(Reach {
+                bytes: 8 + 8 + 0x20,
+                frame: Some((5, 0))
+            })
+        );
+        // After the push only: rbp is still the caller's.
+        assert_eq!(
+            reach_of(&FRAMED, Some(1), none).map(|r| r.frame),
+            Some(None)
+        );
+        assert_eq!(
+            reach_of(&FRAMED, Some(4), none).map(|r| r.frame),
+            Some(Some((5, 0)))
+        );
+    }
+
+    #[test]
+    fn reach_follows_a_chain_and_refuses_what_it_cannot_read() {
+        // One push, padded to an even count, then the chained entry.
+        let mut head = [0; 20];
+        head[..8].copy_from_slice(&[0x01 | 4 << 3, 1, 1, 0x00, 0x01, 0x50, 0, 0]);
+        head[17] = 1;
+        let chained = |rva, scratch: &mut [u8; MAX_UNWIND_INFO]| {
+            if rva != 0x100 {
+                return None;
+            }
+            scratch[..PLAIN.len()].copy_from_slice(&PLAIN);
+            Some(PLAIN.len())
+        };
+        assert_eq!(
+            reach_of(&head, None, chained),
+            Some(Reach {
+                bytes: 8 + 8 + 8 + 0x28,
+                frame: None
+            })
+        );
+        assert_eq!(reach_of(&head, None, none), None);
+        assert_eq!(reach_of(&[0x03, 0, 0, 0], None, none), None);
+        // Codes past the data.
+        assert_eq!(reach_of(&[0x01, 5, 4, 0x00, 0x05, 0x42], None, none), None);
+    }
+
+    #[test]
+    fn reach_includes_the_saved_register_width_and_offset() {
+        // SAVE_NONVOL, SAVE_NONVOL_FAR, SAVE_XMM128, SAVE_XMM128_FAR.
+        let codes = [
+            (&[1, 8, 2, 0, 8, 0x34, 8, 0][..], 72),
+            (&[1, 8, 3, 0, 8, 0x35, 0, 0, 8, 0][..], 0x8_0008),
+            (&[1, 8, 2, 0, 8, 0x68, 8, 0][..], 144),
+            (&[1, 8, 3, 0, 8, 0x69, 0, 0, 16, 0][..], 0x10_0010),
+        ];
+        for (info, bytes) in codes {
+            assert_eq!(
+                reach_of(info, None, none),
+                Some(Reach { bytes, frame: None })
+            );
+            assert_eq!(
+                reach_of(info, Some(7), none),
+                Some(Reach {
+                    bytes: 8,
+                    frame: None
+                })
+            );
+        }
+
+        // The extra operand lies in alignment padding, outside CountOfCodes.
+        assert_eq!(reach_of(&[1, 8, 1, 0, 8, 0x68, 8, 0], None, none), None);
+    }
+
+    #[test]
+    fn frame_rejects_a_restore_that_crosses_the_stack_end() {
+        #[repr(C)]
+        struct Metadata {
+            entry: [u32; 3],
+            info: [u8; 8],
+        }
+
+        let metadata = Metadata {
+            entry: [0x100, 0x200, 12],
+            info: [1, 8, 2, 0, 8, 0x68, 4, 0],
+        };
+        let image = (&raw const metadata) as u64;
+        let stack = [0u64; 16];
+        let base = stack.as_ptr() as u64;
+        let context = CONTEXT {
+            Rip: image + 0x120,
+            Rsp: base,
+            ..unsafe { std::mem::zeroed() }
+        };
+        assert!(frame_is_readable(image, image, &context, base, base + 80));
+        assert!(!frame_is_readable(image, image, &context, base, base + 79));
+        assert!(!frame_is_readable(
+            image,
+            image,
+            &context,
+            base + 8,
+            base + 80
+        ));
+    }
+
+    #[test]
+    fn unwind_metadata_read_preserves_a_guard_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+
+        // SAFETY: allocate two writable pages of our own, seed a header in
+        // the first and protect the second before trying the bounded reads.
+        let (address, guarded) = unsafe {
+            let pages = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!pages.is_null());
+            let guarded = pages.add(0x1000);
+            let header = guarded.sub(4);
+            header.copy_from_nonoverlapping([1, 8, 2, 0].as_ptr(), 4);
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(guarded.cast(), 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                0
+            );
+            (header as u64, guarded as u64)
+        };
+        let mut header = [0; 4];
+        let mut info = [0; MAX_UNWIND_INFO];
+        assert!(read_memory(address, &mut header));
+        assert_eq!(header, [1, 8, 2, 0]);
+        assert_eq!(read_unwind_info(address, 0, &mut info), None);
+        assert_eq!(memory_at(guarded as usize), "a guard page");
+
+        // SAFETY: release the reservation created above.
+        unsafe { VirtualFree((guarded - 0x1000) as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]

@@ -13,7 +13,8 @@ where there is one; the default is the behaviour described.
   screen while the title runs; the picture is stretched to either. DXGI's own
   Alt+Enter, which would make the swap chain exclusive full screen, is turned off.
 - **Settings for an RTX 4090 / Ryzen 9 9950X3D / 48 GB** (`scripts\play.ps1
-  -Machine 4090`, picked for any NVIDIA card): the thread counts and switches
+  -Machine 4090`, picked for any NVIDIA card; `-Machine laptop` for 16 GB of RAM,
+  [laptop-16gb.md](laptop-16gb.md)): the thread counts and switches
   `scripts\play.ps1` sets. `-Safe` keeps the wave-wide list there: without it four
   wave64 programs do not translate on a 32-lane card and their draws are dropped.
 - **A performance panel** in the top-left corner (diagnostics builds; on by
@@ -24,6 +25,15 @@ where there is one; the default is the behaviour described.
   the game's adapter, from Windows' "GPU Engine" counters (labelled `APP`), or an
   estimate from the queue's idle time when Windows has no sample (`EST`). The
   HUD is Belo's.
+
+- **A chosen monitor** (`VICTORY_MONITOR`): the device name (`DISPLAY3`) or the
+  monitor's 1-based number in Windows' enumeration order (the order
+  `EnumDisplayMonitors` lists them, not the numbers in Windows' display settings).
+  The title's own top-level window is centred on that monitor's work area (a size
+  left to Windows becomes three quarters of it, then `VICTORY_WINDOW_MAX` applies),
+  and with `VICTORY_FULLSCREEN=1` full screen covers that monitor. Tool, child and
+  owned windows stay where Windows puts them; the separate DXGI fallback window
+  keeps its own placement. Example: `scripts\play.ps1 -Exe <exe> -More @{VICTORY_MONITOR='DISPLAY3'}`.
 
 ## Memory and frame rate
 
@@ -95,3 +105,5 @@ How each of these was found, with the numbers:
   ones still queued are written before the process exits.
 - Diagnostics builds: `VICTORY_WALLS_TRACE=1` logs the source of each read-back;
   a placed texture view that gets no host view says why once per kind.
+- [VIctory-NVIDIA changes](victory-nvidia.md) covers the source revisions,
+  graphics fixes, optional settings and fault capture reader.

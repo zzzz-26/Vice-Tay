@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+mimalloc = { workspace = true, optional = true }
 zlib-rs.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
@@ -26,6 +27,7 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+mimalloc = ["dep:mimalloc"]
 
 [lints]
 workspace = true

@@ -18,7 +18,7 @@ std::arch::global_asm!(
     ".globl victory_safe_copy_at",
     ".globl victory_safe_copy_after",
     ".globl victory_safe_copy_failed",
-    // rcx destination, rdx source, r8 bytes; eax: whether all were copied.
+    // rcx destination, rdx source, r8 bytes; rax: bytes copied.
     // A leaf that leaves the stack alone (the two registers it must give
     // back are kept in volatile ones), so a stack walk through it works.
     "victory_safe_copy:",
@@ -30,12 +30,13 @@ std::arch::global_asm!(
     "victory_safe_copy_at:",
     "rep movsb",
     "victory_safe_copy_after:",
-    "mov eax, 1",
+    "mov rax, r8",
     "mov rsi, r10",
     "mov rdi, r11",
     "ret",
     "victory_safe_copy_failed:",
-    "xor eax, eax",
+    "mov rax, r8",
+    "sub rax, rcx",
     "mov rsi, r10",
     "mov rdi, r11",
     "ret",
@@ -174,7 +175,7 @@ std::arch::global_asm!(
 );
 
 unsafe extern "system" {
-    fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
     fn victory_safe_copy_at();
     fn victory_safe_copy_after();
     fn victory_safe_copy_failed();
@@ -396,9 +397,18 @@ pub(crate) fn on() -> bool {
 /// Of the two ranges, what is not title memory must be valid, and no Rust
 /// reference may cover the destination. [`on`] must have been asked.
 pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    // SAFETY: the caller's.
+    unsafe { copy_count(dst, src, len) == len }
+}
+
+/// Like [`copy`], returning the length of the prefix actually written.
+///
+/// # Safety
+/// As [`copy`]'s. A forward copy requires disjoint spans or `dst <= src`.
+pub(crate) unsafe fn copy_count(dst: *mut u8, src: *const u8, len: usize) -> usize {
     // SAFETY: a fault on either side leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
-    unsafe { victory_safe_copy(dst, src, len) != 0 }
+    unsafe { victory_safe_copy(dst, src, len) }
 }
 
 /// For the fault handler: where a fault at instruction `at` is to go on, if

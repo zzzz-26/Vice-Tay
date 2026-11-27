@@ -194,6 +194,8 @@ struct Inner {
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
     scheduled: bool,
+    /// The title needs the open back list for a synchronous host API call.
+    waiting_for_back: bool,
     /// The list of ours (0: none yet).
     back: usize,
     /// That list was closed by the stream.
@@ -235,6 +237,9 @@ impl Recording {
                 let mut inner = held(&self.inner);
                 let Some(chunk) = inner.chunks.pop_front() else {
                     inner.scheduled = false;
+                    if inner.waiting_for_back {
+                        self.moved.notify_all();
+                    }
                     return;
                 };
                 if inner.back == 0 {
@@ -364,6 +369,31 @@ fn front<'a>(this: This) -> &'a mut Front {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time.
     unsafe { &mut (*this.cast_mut().cast::<List>()).thin }
+}
+
+/// Lets a host API record at the current position of the title's open list.
+/// The caller is the sole writer of this list until its API call returns.
+/// Only preceding chunks of this recording have to finish translation.
+pub(crate) fn for_external(this: This) -> Option<This> {
+    if this.is_null() {
+        return None;
+    }
+    if super::host_list(this).is_some() {
+        return Some(this);
+    }
+    let front = front(this);
+    if front.closed {
+        return None;
+    }
+    front.hand_over();
+    let recording = front.recording.as_ref()?;
+    let mut inner = held(&recording.inner);
+    if inner.scheduled {
+        inner.waiting_for_back = true;
+        inner = recording.moved.wait_while(inner, |i| i.scheduled).unwrap_or_else(|e| e.into_inner());
+        inner.waiting_for_back = false;
+    }
+    (inner.back != 0).then_some(inner.back as This)
 }
 
 /// An argument as a word.

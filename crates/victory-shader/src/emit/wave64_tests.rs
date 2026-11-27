@@ -1497,8 +1497,8 @@ fn a_wave32_backward_permute_drops_the_high_and_sub_dword_address_bits() {
 }
 
 /// A console wave32 program with console lanes (`v_mbcnt`) in a 32 x 2 group: thread (x, y)
-/// stores 1 at dword 32y + x. Every dword must be written once: the host's relabelled thread
-/// ids are a bijection of the group. A 32-lane host need not give a host wave a 32-aligned run
+/// stores the group-info SGPR at dword 32y + x. Every dword must be written once and carry
+/// the console wave for its relabelled ID. A 32-lane host need not give a host wave a 32-aligned run
 /// of flat ids (2-D groups are filled from 16 x 2 tiles on NVIDIA and RDNA), so the first flat
 /// id of a wave rounded down gave two waves the same ids (issue #1243); the waves now take
 /// their threads from a group counter. With `VICTORY_THREAD_TICKET=0` (the old rounding) the
@@ -1511,13 +1511,13 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
         0x3408_0285, // v_lshlrev_b32 v4, 5, v1
         0x4A08_0104, // v_add_nc_u32 v4, v4, v0
         0x3408_0882, // v_lshlrev_b32 v4, 2, v4
-        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x7E0A_0206, // v_mov_b32 v5, s6 (group info)
         0x38 << 26 | 0x1C << 18 | 1 << 12,
         0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
     ];
     let mut native = native_of(&words, false, 64);
     native.io = StageIo::Cs(ComputeIo {
-        rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, thread ids x and y in v0, v1
+        rsrc2: 5 << 1 | 1 << 7 | 1 << 10 | 1 << 11, // group X in s5, group info in s6, thread x/y
         threads: [32, 2, 1],
     });
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
@@ -1564,11 +1564,11 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
         Some(out[0][..64].to_vec())
     };
     let Some(got) = run(&shader) else { return };
-    let missing: Vec<usize> = (0..64).filter(|&i| got[i] != 1).collect();
-    assert!(missing.is_empty(), "dwords not written once: {missing:?}");
+    let expected: Vec<_> = (0_u32..64).map(|thread| 2 | ((thread / 32) << 6)).collect();
+    assert_eq!(got, expected, "group info must use the relabelled console wave");
     if let Some(before) = run(&old) {
-        let written = before.iter().filter(|&&d| d == 1).count();
+        let written = before.iter().filter(|&&d| d != 0).count();
         eprintln!("the old rounding on this device: {written} of 64 dwords written");
     }
-    eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
+    eprintln!("ran on the hardware device: 64 console threads with the expected wave indices");
 }

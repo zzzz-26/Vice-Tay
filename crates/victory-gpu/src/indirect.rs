@@ -646,11 +646,11 @@ void main() {
 }
 "#;
 
-    struct WarpHarness {
-        device: ID3D12Device,
+    pub(crate) struct WarpHarness {
+        pub(crate) device: ID3D12Device,
         queue: ID3D12CommandQueue,
         allocator: ID3D12CommandAllocator,
-        list: ID3D12GraphicsCommandList,
+        pub(crate) list: ID3D12GraphicsCommandList,
         fence: ID3D12Fence,
         submitted: u64,
         event: HANDLE,
@@ -672,7 +672,7 @@ void main() {
     }
 
     impl WarpHarness {
-        fn new() -> Option<Self> {
+        pub(crate) fn new() -> Option<Self> {
             Self::on(true)
         }
 
@@ -727,7 +727,7 @@ void main() {
         }
 
         /// CPU-mapped L0 write-back buffer matching `Shadow`'s heap type.
-        fn shared_buffer(&self, size: u64) -> (ID3D12Resource, *mut u8, u64) {
+        pub(crate) fn shared_buffer(&self, size: u64) -> (ID3D12Resource, *mut u8, u64) {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_CUSTOM,
                 CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -770,7 +770,7 @@ void main() {
         }
 
         /// Device-local `DEFAULT`-heap UAV scratch buffer.
-        fn default_uav(&self, size: u64) -> ID3D12Resource {
+        pub(crate) fn default_uav(&self, size: u64) -> ID3D12Resource {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_DEFAULT,
                 ..Default::default()
@@ -827,7 +827,25 @@ void main() {
             sig.unwrap()
         }
 
-        fn submit_and_wait(&mut self) {
+        pub(crate) fn clamp_dispatch(
+            &self,
+            source: &ID3D12Resource,
+            budget: u64,
+            bounded: &ID3D12Resource,
+        ) {
+            assert!(record_clamp_as(
+                &self.clamp,
+                &self.list,
+                (bounded, D3D12_RESOURCE_STATE_COMMON),
+                budget,
+                (source, 0),
+                None,
+                (2, 12, 1),
+                false,
+            ));
+        }
+
+        pub(crate) fn submit_and_wait(&mut self) {
             self.submitted += 1;
             // SAFETY: closing, executing, waiting on fence, and resetting our list.
             unsafe {

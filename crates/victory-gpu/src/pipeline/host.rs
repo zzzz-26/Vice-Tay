@@ -594,6 +594,7 @@ impl HostPipeline {
                 return None;
             }
         };
+        let use_library = samplers.is_empty() || super::library::allows_static_samplers(host);
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -612,7 +613,7 @@ impl HostPipeline {
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
-                &name,
+                use_library.then_some(name.as_str()),
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -673,7 +674,10 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let pso = match mesh_pipeline(
+                &host.device, &root, code(0), code(1), g, depth_bounds,
+                use_library.then_some(name.as_str()),
+            ) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -761,11 +765,12 @@ impl HostPipeline {
             ),
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
+            let library_name = use_library.then_some(name);
             if depth_bounds {
-                return graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth1(), name);
+                return graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth1(), library_name);
             }
             super::library::pipeline(
-                name,
+                library_name,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
                 // SAFETY: as above.
@@ -854,7 +859,7 @@ struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 fn stream_pipeline<S>(
     device: &ID3D12Device,
     stream: &mut S,
-    name: &str,
+    name: Option<&str>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
@@ -879,7 +884,7 @@ fn graphics_depth_bounds_pipeline(
     root: &ID3D12RootSignature,
     d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC1,
-    name: &str,
+    name: Option<&str>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     #[repr(C)]
@@ -952,7 +957,7 @@ fn mesh_pipeline(
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     depth_bounds: bool,
-    name: &str,
+    name: Option<&str>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     #[repr(C)]
@@ -1045,12 +1050,19 @@ fn root_signature(
             },
         },
     };
+    serialize_root_signature(device, &desc)
+}
+
+fn serialize_root_signature(
+    device: &ID3D12Device,
+    desc: &D3D12_VERSIONED_ROOT_SIGNATURE_DESC,
+) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
-        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+        if let Err(e) = D3D12SerializeVersionedRootSignature(desc, &mut blob, Some(&mut error)) {
             if let Some(error) = error {
                 let text = std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),
@@ -1144,9 +1156,9 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, Some(&name)).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, Some(&name)).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
@@ -1323,14 +1335,23 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
-        let Some(dxc) = dxc() else {
-            eprintln!("no PC dxc.exe; skipped");
-            return;
+        let vs = crate::host::compile(VS, windows::core::s!("main"), windows::core::s!("vs_5_1"))
+            .expect("compile depth-bounds vertex shader");
+        let ps = crate::host::compile(PS, windows::core::s!("main"), windows::core::s!("ps_5_1"))
+            .expect("compile depth-bounds pixel shader");
+        // These shaders have no bindings. Direct heap indexing requires a
+        // newer runtime than the depth-bounds feature this test exercises.
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_0,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_0: D3D12_ROOT_SIGNATURE_DESC {
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                    ..Default::default()
+                },
+            },
         };
-        let dir = tempfile::tempdir().unwrap();
-        let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
-        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) =
+            serialize_root_signature(&host.device, &desc).expect("create depth-bounds root signature");
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
@@ -1381,10 +1402,10 @@ mod tests {
             &[&vs, &ps],
             &g.describe(),
         );
-        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), Some(&name))
             .expect("depth-bounds PSO made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), Some(&name))
             .expect("depth-bounds PSO made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,

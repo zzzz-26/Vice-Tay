@@ -126,7 +126,7 @@ impl Target {
 
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: crate::host::TextureReadback,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -177,11 +177,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = host.texture_readback_buffer(total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(buffer.resource()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
@@ -197,8 +197,15 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
+/// Temporary pixels and the layouts reused by one thread returning textures.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    pixels: Vec<u8>,
+    tiling: victory_formats::texture::TilingCache,
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
-pub(crate) fn land(back: &Back) {
+pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
@@ -212,17 +219,25 @@ pub(crate) fn land(back: &Back) {
     }
     let (at, end) = back.range();
     let size = end - at;
-    let mut tiled = vec![0u8; size];
+    if scratch.pixels.len() < size {
+        scratch.pixels.reserve_exact(size - scratch.pixels.len());
+        scratch.pixels.resize(size, 0);
+    }
+    let tiled = &mut scratch.pixels[..size];
     // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
+    if !crate::host::read_into(at as *const u8, tiled) {
         return;
     }
+    let buffer = back.buffer.resource();
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
-    unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
-            return;
-        }
+    if unsafe { buffer.Map(0, None, Some(&mut data)) }.is_err() {
+        return;
+    }
+    if data.is_null() {
+        // SAFETY: Map succeeded, even though it supplied no pointer.
+        unsafe { buffer.Unmap(0, None) };
+        return;
     }
     for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
         let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
@@ -231,23 +246,75 @@ pub(crate) fn land(back: &Back) {
         let len = pitch * rows as usize * f.Depth as usize;
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+        let pitches = (pitch, pitch * rows as usize);
+        if let Err(e) = scratch.tiling.tile(&back.layout, tiled, (mip, slice), linear, pitches) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
+            unsafe { buffer.Unmap(0, None) };
             return;
         }
     }
     // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
+    unsafe { buffer.Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+        let stats = back.buffer.stats();
+        tracing::info!(
+            copied,
+            bytes = size,
+            created = stats.created,
+            reused = stats.reused,
+            allocation_failures = stats.allocation_failures,
+            allocation_us = stats.allocation_us,
+            peak_allocation_us = stats.peak_allocation_us,
+            active_buffers = stats.active_buffers,
+            active_bytes = stats.active_bytes,
+            peak_active_bytes = stats.peak_active_bytes,
+            idle_bytes = stats.idle_bytes,
+            peak_idle_bytes = stats.peak_idle_bytes,
+            "texture readback landed"
+        );
     }
 }
 
+/// Register the initialized upload row copied by the host's test list as a
+/// linear 1×1 readback, so it goes through the real landing/reset path.
+#[cfg(test)]
+pub(crate) fn buffer_back_for_test(buffer: crate::host::TextureReadback, dst: &mut [u8; 256]) -> Back {
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    let layout = Layout::new(&Desc {
+        dimension: Dimension::Tex2d,
+        width: 1,
+        height: 1,
+        depth: 1,
+        mips: 1,
+        element_bytes: 4,
+        block: 1,
+        samples: 1,
+        swizzle: Swizzle::LINEAR,
+    }).unwrap();
+    assert_eq!(layout.size, dst.len() as u64);
+    let at = dst.as_mut_ptr() as usize;
+    Back {
+        buffer,
+        footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                Width: 1,
+                Height: 1,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        }],
+        rows: vec![1],
+        mips: 1,
+        layout,
+        ticket: track(at, at, at + dst.len()),
+    }
+}
 
 #[cfg(test)]
 mod tests {

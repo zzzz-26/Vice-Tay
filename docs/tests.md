@@ -12,13 +12,18 @@ what each recent session played and measured. Newest first.
   game runs at a time.
 - **Play.** Either by hand, through scripted pad input sent while watching a
   capture after every move, or by a scripted route (walk, run, turn the camera,
-  step aside). A capture every minute either way, and the whole screen recorded
-  to video on the card's encoder.
+  step aside). Take a capture every minute and record the full verification
+  from the game window on the card's encoder.
 - **Measure.** fps and the frame's parts from the game's own once-a-second frame
   lines in the world (lines with over 1,000 draws a frame); the game's memory,
   the card's memory, load, power and temperature sampled every 20 s.
 - **Compare.** A change that could cost frames is run against a control built
-  from the same base, played the same way for the same length.
+  from the same base, played the same way for the same length. Match the scene,
+  camera, resolution, upscaler, frame generation and recording settings.
+- **Review.** Watch the full video before reporting results. Check colour,
+  lighting, textures, reflections, HUD legibility, flicker and ghosting.
+  Record the timestamps of visual changes and artifacts beside the frame-rate
+  results. Keep recordings local under the [asset policy](asset-policy.md).
 
 ## Sessions
 

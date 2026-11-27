@@ -135,16 +135,11 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
-        // The list affects output only with the explicit global opt-in.
-        if std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
-            && let Some(list) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY").filter(|v| !v.is_empty())
-        {
-            bytes.extend_from_slice(b"VICTORY_WAVE_WIDE_ONLY=");
-            bytes.extend_from_slice(list.as_encoded_bytes());
-            bytes.push(0);
-        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        if victory_shader::emit::early_depth_enabled() {
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1\0");
+        }
         // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
         // bytes. Only when on, so the translations cached without it keep
         // their key.
@@ -228,7 +223,16 @@ fn cached(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
 ) -> Result<HostShader, String> {
-    cached_by(cache, build, SOURCE, container, translate, refresh)
+    let per_shader_build = victory_shader::emit::wave_wide_cache_override(container)
+        .map_or(*build, |enabled| {
+            *blake3::Hasher::new()
+                .update(build)
+                .update(b"wave-wide-shader-v1\0")
+                .update(&[u8::from(enabled)])
+                .finalize()
+                .as_bytes()
+        });
+    cached_by(cache, &per_shader_build, SOURCE, container, translate, refresh)
 }
 
 /// [`cached`] with the build of the translator given (`source`).

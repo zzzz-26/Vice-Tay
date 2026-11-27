@@ -163,17 +163,39 @@ fn place(
     width: i32,
     height: i32,
 ) -> (Windowed, Option<WindowState>) {
-    let windowed = (ex_style, style, fit(parent, x, y, width, height));
-    // SAFETY: plain queries of the primary monitor's size.
-    let screen = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
-    let Some(full) = full_screen(ex_style, style, !parent.is_null(), screen) else {
+    if !placeable(ex_style, style, !parent.is_null()) || zero_sized(style, width, height) {
+        return ((ex_style, style, (x, y, width, height)), None);
+    }
+    // Use the chosen monitor's work area for the windowed size and its
+    // whole area for full screen.
+    let chosen = chosen_monitor();
+    let windowed = (ex_style, style, fit(x, y, width, height, chosen.map(|(work, _)| work)));
+    let (origin, screen) = match chosen.map(|(_, whole)| whole) {
+        Some(m) => ((m.left, m.top), (m.right - m.left, m.bottom - m.top)),
+        // SAFETY: plain queries of the primary monitor's size.
+        None => ((0, 0), unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) }),
+    };
+    let Some(full) = full_screen(ex_style, style, !parent.is_null(), screen)
+        .map(|(e, s, (_, _, w, h))| (e, s, (origin.0, origin.1, w, h)))
+    else {
         return (windowed, None);
     };
     let full_screen = full_screen_on();
     if full_screen {
-        tracing::info!(width = screen.0, height = screen.1, "title window made full screen");
+        tracing::info!(width = screen.0, height = screen.1, left = origin.0, top = origin.1, "title window made full screen");
     }
     (if full_screen { full } else { windowed }, Some(WindowState { windowed, full_screen }))
+}
+
+/// Whether a window asks for no area of its own. Win32 supplies a default
+/// size to overlapped windows, and uses zero size for a pop-up or child
+/// with a default width.
+fn zero_sized(style: u32, width: i32, height: i32) -> bool {
+    match width {
+        wm::CW_USEDEFAULT => style & (wm::WS_POPUP | wm::WS_CHILD) != 0,
+        0 => true,
+        _ => height == 0,
+    }
 }
 
 /// The styles and place the title's top-level window had (or would have
@@ -273,11 +295,18 @@ fn full_screen_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1"))
 }
 
+/// Whether a window the title makes is its own top-level window, the kind that
+/// goes full screen or onto the chosen monitor: not one with a parent or
+/// owner, not a child, not a tool window.
+fn placeable(ex_style: u32, style: u32, parented: bool) -> bool {
+    !parented && style & wm::WS_CHILD == 0 && ex_style & wm::WS_EX_TOOLWINDOW == 0
+}
+
 /// The styles and place of a full-screen window on a screen of `screen`
 /// pixels: a frameless popup over all of it. None for a window that keeps
 /// its own (one with a parent or owner, a child, a tool window).
 fn full_screen(ex_style: u32, style: u32, parented: bool, screen: (i32, i32)) -> Option<(u32, u32, (i32, i32, i32, i32))> {
-    if parented || style & wm::WS_CHILD != 0 || ex_style & wm::WS_EX_TOOLWINDOW != 0 || screen.0 <= 0 || screen.1 <= 0 {
+    if !placeable(ex_style, style, parented) || screen.0 <= 0 || screen.1 <= 0 {
         return None;
     }
     let kept = wm::WS_VISIBLE | wm::WS_DISABLED | wm::WS_CLIPCHILDREN | wm::WS_CLIPSIBLINGS;
@@ -291,14 +320,28 @@ fn full_screen(ex_style: u32, style: u32, parented: bool, screen: (i32, i32)) ->
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+fn fit(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    chosen: Option<RECT>,
+) -> (i32, i32, i32, i32) {
+    // A monitor named by `VICTORY_MONITOR` (its work area, `chosen`): the
+    // title's own top-level window goes there, fitted and centred.
+    if let Some(area) = chosen
+        && let Some(placed) = on_monitor(&area, width, height, window_limit())
+    {
+        tracing::info!(width, height, to = ?placed, "title window put on the monitor VICTORY_MONITOR names");
+        return placed;
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
     let limit = window_limit();
     let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
+    if known == 0 || fitted == (width, height) {
         return (x, y, width, height);
     }
     tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
@@ -306,6 +349,75 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// Where a window of `width` x `height` goes on the work area `area` of the
+/// chosen monitor: a size the title left to Windows (`CW_USEDEFAULT`) is
+/// first made three quarters of the area (as the restore path does), then
+/// the size is fitted to the area and to `limit` (`VICTORY_WINDOW_MAX`) and
+/// centred. `None` for a window with no size of its own (a zero-sized
+/// helper keeps what it asked for).
+fn on_monitor(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> Option<(i32, i32, i32, i32)> {
+    let (aw, ah) = (area.right - area.left, area.bottom - area.top);
+    if aw <= 0 || ah <= 0 {
+        return None;
+    }
+    let (width, height) = if width == wm::CW_USEDEFAULT { ((aw * 3 / 4).max(1), (ah * 3 / 4).max(1)) } else { (width, height) };
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let (w, h) = fit_with_limit(area, width, height, limit);
+    Some((area.left + (aw - w) / 2, area.top + (ah - h) / 2, w, h))
+}
+
+/// The monitor `VICTORY_MONITOR` names: its device name (`DISPLAY3` or
+/// `\\.\DISPLAY3`), or its 1-based place in the order Windows lists the
+/// monitors; its work area and its whole area. Unset or not found: none
+/// (the primary monitor, as before). (Ours, 31790ae7.)
+fn chosen_monitor() -> Option<(RECT, RECT)> {
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+    let want = std::env::var("VICTORY_MONITOR").ok()?;
+    let want = want.trim().trim_start_matches(r"\\.\").to_ascii_uppercase();
+    if want.is_empty() {
+        return None;
+    }
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows_sys::core::BOOL {
+        // SAFETY: `data` is the list below, alive for the enumeration.
+        let list = unsafe { &mut *(data as *mut Vec<(String, RECT, RECT)>) };
+        // SAFETY: a plain struct of numbers.
+        let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: a monitor handle from the enumeration and a sized struct.
+        if unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) } != 0 {
+            let end = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            list.push((String::from_utf16_lossy(&info.szDevice[..end]), info.monitorInfo.rcWork, info.monitorInfo.rcMonitor));
+        }
+        1
+    }
+    let mut list: Vec<(String, RECT, RECT)> = Vec::new();
+    // SAFETY: the callback only touches `list`, which outlives the call.
+    unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), (&raw mut list) as LPARAM) };
+    let found = pick_monitor(&list, &want);
+    if found.is_none() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let names: Vec<&str> = list.iter().map(|m| m.0.as_str()).collect();
+            tracing::warn!(want, ?names, "VICTORY_MONITOR names no monitor: the primary one is used");
+        });
+    }
+    found
+}
+
+/// The entry of `list` (device name, work area, whole area) that `want`
+/// (upper case, without `\\.\`) names: a 1-based place, or a device name.
+fn pick_monitor(list: &[(String, RECT, RECT)], want: &str) -> Option<(RECT, RECT)> {
+    match want.parse::<usize>() {
+        Ok(n) if n >= 1 => list.get(n - 1).map(|m| (m.1, m.2)),
+        _ => list
+            .iter()
+            .find(|(name, _, _)| name.trim_start_matches(r"\\.\").eq_ignore_ascii_case(want))
+            .map(|m| (m.1, m.2)),
+    }
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -396,8 +508,12 @@ fn note_shown(hwnd: HWND) {
     }
     // SAFETY: both queries borrow a window of this thread's.
     let top = unsafe { wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd };
-    if top {
-        let _ = TITLE_WINDOW.compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed);
+    if top
+        && TITLE_WINDOW
+            .compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        super::gameinput::mouse::attach(hwnd);
     }
 }
 
@@ -428,9 +544,13 @@ extern "system" fn window_proc(
         toggle_full_screen(hwnd);
         return 0;
     }
+    if title_window && message == wm::WM_INPUT {
+        super::gameinput::mouse::receive(hwnd, wparam, lparam);
+    }
     if message == wm::WM_NCDESTROY {
         WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(hwnd as usize));
         if title_window {
+            super::gameinput::mouse::detach(hwnd);
             // a window the title makes again is its window then
             TITLE_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
         }
@@ -597,6 +717,9 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // DLSS's features and NGX, before the device goes with the process.
+    #[cfg(windows)]
+    crate::modules::fidelityfx::shut_down();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
@@ -622,6 +745,93 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window on a monitor left of and above the primary (negative origin),
+    /// whose size the title left to Windows, with a 1280x720 cap: a default
+    /// size resolved on that monitor first, then capped and centred; that is
+    /// also the rectangle the first exit from full screen restores.
+    #[test]
+    fn a_default_sized_window_on_the_chosen_monitor_is_resolved_then_capped() {
+        let area = RECT { left: -2560, top: -200, right: 0, bottom: 1240 };
+        let default = wm::CW_USEDEFAULT;
+        let placed = on_monitor(&area, default, default, Some((1280, 720))).unwrap();
+        assert_eq!(placed, (-1920, 160, 1280, 720));
+        // Without the cap: three quarters of the work area, centred.
+        assert_eq!(on_monitor(&area, default, default, None), Some((-2240, -20, 1920, 1080)));
+        // A size of its own, larger than the cap: fitted, centred.
+        assert_eq!(on_monitor(&area, 2560, 1440, Some((1280, 720))), Some((-1920, 160, 1280, 720)));
+        // A zero-sized helper keeps what it asked for.
+        assert_eq!(on_monitor(&area, 0, 0, None), None);
+        // The first exit from full screen restores that rectangle.
+        let windowed = (wm::WS_EX_WINDOWEDGE, wm::WS_OVERLAPPEDWINDOW, placed);
+        assert_eq!(toggled(true, windowed, area).2, placed);
+    }
+
+    /// Only the title's own top-level windows are moved or made full screen.
+    #[test]
+    fn tool_child_and_owned_windows_are_not_placed() {
+        assert!(placeable(wm::WS_EX_APPWINDOW, wm::WS_OVERLAPPEDWINDOW, false));
+        assert!(!placeable(wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, false));
+        assert!(!placeable(0, wm::WS_CHILD, false));
+        assert!(!placeable(0, wm::WS_OVERLAPPEDWINDOW, true));
+
+        let window = (25, 60, 0, 0);
+        let parent = std::ptr::null_mut();
+        let (placed, state) = place(0, wm::WS_POPUP, parent, window.0, window.1, window.2, window.3);
+        assert_eq!(placed, (0, wm::WS_POPUP, window));
+        assert!(state.is_none(), "the zero-sized helper is not eligible for full screen");
+
+        let (placed, state) = place(wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, parent, 25, 60, 3000, 2000);
+        assert_eq!(placed, (wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, (25, 60, 3000, 2000)));
+        assert!(state.is_none(), "the tool window keeps its placement");
+    }
+
+    /// A default-sized window (`CW_USEDEFAULT` width; Windows ignores the height, here 0) is
+    /// a normal window: placed, and kept for full screen and its toggle; a width of 0 is not.
+    #[test]
+    fn a_default_width_with_zero_height_is_not_a_zero_sized_helper() {
+        let default = wm::CW_USEDEFAULT;
+        let style = wm::WS_OVERLAPPEDWINDOW;
+        assert!(!zero_sized(style, default, 0));
+        assert!(!zero_sized(style, default, default));
+        assert!(zero_sized(style, 0, 0));
+        assert!(zero_sized(style, 0, 600));
+        assert!(zero_sized(style, 800, 0));
+        let (_, state) = place(
+            wm::WS_EX_APPWINDOW, style, std::ptr::null_mut(), default, 0, default, 0,
+        );
+        assert!(state.is_some(), "the default-sized window keeps its full-screen state");
+    }
+
+    #[test]
+    fn a_popup_with_default_width_keeps_its_native_zero_size() {
+        let default = wm::CW_USEDEFAULT;
+        let style = wm::WS_POPUP;
+        assert!(zero_sized(style, default, 0));
+        assert!(zero_sized(style, default, 600));
+        assert!(zero_sized(wm::WS_CHILD, default, 600));
+        assert!(!zero_sized(style, 800, 600));
+        let (placed, state) = place(0, style, std::ptr::null_mut(), 10, 20, default, 0);
+        assert_eq!(placed, (0, style, (10, 20, default, 0)));
+        assert!(state.is_none());
+    }
+
+    /// `VICTORY_MONITOR`: a device name with or without its prefix, any
+    /// case, or a 1-based place; anything else names none.
+    #[test]
+    fn a_monitor_is_picked_by_name_or_place() {
+        let rect = |l: i32, w: i32| RECT { left: l, top: 0, right: l + w, bottom: 1440 };
+        let list = vec![
+            (r"\\.\DISPLAY1".to_owned(), rect(0, 3440), rect(0, 3440)),
+            (r"\\.\DISPLAY3".to_owned(), rect(3440, 2560), rect(3440, 2560)),
+        ];
+        assert_eq!(pick_monitor(&list, "DISPLAY3").map(|m| m.1.left), Some(3440));
+        assert_eq!(pick_monitor(&list, "display1").map(|m| m.1.left), Some(0));
+        assert_eq!(pick_monitor(&list, "2").map(|m| m.1.left), Some(3440));
+        assert!(pick_monitor(&list, "3").is_none());
+        assert!(pick_monitor(&list, "0").is_none());
+        assert!(pick_monitor(&list, "DISPLAY2").is_none());
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 

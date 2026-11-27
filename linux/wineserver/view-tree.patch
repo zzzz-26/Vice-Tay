@@ -1,0 +1,165 @@
+diff --git a/server/mapping.c b/server/mapping.c
+index a3f54ac55a4..ce9bc4076e7 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -24,6 +24,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdarg.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/types.h>
+@@ -39,6 +40,7 @@
+ #include "windef.h"
+ #include "winternl.h"
+ #include "ddk/wdm.h"
++#include "wine/rbtree.h"
+ 
+ #include "file.h"
+ #include "handle.h"
+@@ -131,6 +133,8 @@ static struct list shared_map_list = LIST_INIT( shared_map_list );
+ struct memory_view
+ {
+     struct list     entry;           /* entry in per-process view list */
++    struct rb_entry tree_entry;      /* entry in the view tree, keyed by process and base */
++    struct process *process;         /* process the view is mapped in */
+     struct fd      *fd;              /* fd for mapped file */
+     struct ranges  *committed;       /* list of committed ranges in this mapping */
+     struct shared_map *shared;       /* temp file for shared PE mapping */
+@@ -431,14 +435,81 @@ static int create_temp_file( file_pos_t size )
+     return fd;
+ }
+ 
++/* Views of all processes, ordered by process then base address. Views of a
++ * process never overlap (is_valid_view_addr is checked before each is added),
++ * so looking up an address is a search for the view with the nearest base at
++ * or below it. The per-process list stays for its order (main exe first, then
++ * load order), which the debug events and get_exe_view use. */
++struct view_key
++{
++    const struct process *process;
++    client_ptr_t          base;
++};
++
++static int compare_view_key( const struct view_key *key, const struct memory_view *view )
++{
++    if (key->process != view->process)
++        return (uintptr_t)key->process < (uintptr_t)view->process ? -1 : 1;
++    if (key->base != view->base) return key->base < view->base ? -1 : 1;
++    return 0;
++}
++
++static int compare_view( const void *key, const struct rb_entry *entry )
++{
++    return compare_view_key( key, RB_ENTRY_VALUE( entry, const struct memory_view, tree_entry ));
++}
++
++static struct rb_tree view_tree = { compare_view };
++
++/* the view of the process with the highest base at or below addr */
++static struct memory_view *find_view_at_or_below( struct process *process, client_ptr_t addr )
++{
++    struct view_key key = { process, addr };
++    struct rb_entry *entry = view_tree.root;
++    struct memory_view *found = NULL;
++
++    while (entry)
++    {
++        struct memory_view *view = RB_ENTRY_VALUE( entry, struct memory_view, tree_entry );
++        int c = compare_view_key( &key, view );
++        if (!c) return view;
++        if (c < 0) entry = entry->left;
++        else
++        {
++            found = view;
++            entry = entry->right;
++        }
++    }
++    return found && found->process == process ? found : NULL;
++}
++
++/* the view of the process with the lowest base above addr */
++static struct memory_view *find_view_above( struct process *process, client_ptr_t addr )
++{
++    struct view_key key = { process, addr };
++    struct rb_entry *entry = view_tree.root;
++    struct memory_view *found = NULL;
++
++    while (entry)
++    {
++        struct memory_view *view = RB_ENTRY_VALUE( entry, struct memory_view, tree_entry );
++        if (compare_view_key( &key, view ) < 0)
++        {
++            found = view;
++            entry = entry->left;
++        }
++        else entry = entry->right;
++    }
++    return found && found->process == process ? found : NULL;
++}
++
+ /* find a memory view from its base address */
+ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base )
+ {
+-    struct memory_view *view;
+-
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-        if (view->base == base) return view;
++    struct view_key key = { process, base };
++    struct rb_entry *entry = rb_get( &view_tree, &key );
+ 
++    if (entry) return RB_ENTRY_VALUE( entry, struct memory_view, tree_entry );
+     set_error( STATUS_NOT_MAPPED_VIEW );
+     return NULL;
+ }
+@@ -446,11 +517,9 @@ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base
+ /* find a memory view from any address inside it */
+ static struct memory_view *find_mapped_addr( struct process *process, client_ptr_t addr )
+ {
+-    struct memory_view *view;
+-
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-        if (addr >= view->base && addr < view->base + view->size) return view;
++    struct memory_view *view = find_view_at_or_below( process, addr );
+ 
++    if (view && addr < view->base + view->size) return view;
+     set_error( STATUS_NOT_MAPPED_VIEW );
+     return NULL;
+ }
+@@ -465,12 +534,8 @@ static int is_valid_view_addr( struct process *process, client_ptr_t addr, mem_s
+     if (addr + size < addr) return 0;  /* overflow */
+ 
+     /* check for overlapping view */
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-    {
+-        if (view->base + view->size <= addr) continue;
+-        if (view->base >= addr + size) continue;
+-        return 0;
+-    }
++    if ((view = find_view_at_or_below( process, addr )) && view->base + view->size > addr) return 0;
++    if ((view = find_view_above( process, addr )) && view->base < addr + size) return 0;
+     return 1;
+ }
+ 
+@@ -492,8 +557,12 @@ static int generate_dll_event( struct thread *thread, int code, struct memory_vi
+ static int add_process_view( struct thread *thread, struct memory_view *view )
+ {
+     struct process *process = thread->process;
++    struct view_key key = { process, view->base };
+     struct unicode_str name;
+ 
++    view->process = process;
++    rb_put( &view_tree, &key, &view->tree_entry );
++
+     if (view->flags & SEC_IMAGE)
+     {
+         if (is_process_init_done( process ))
+@@ -522,6 +591,7 @@ static void free_memory_view( struct memory_view *view )
+     if (view->committed) release_object( view->committed );
+     if (view->shared) release_object( view->shared );
+     list_remove( &view->entry );
++    rb_remove( &view_tree, &view->tree_entry );
+     free( view );
+ }
+ 

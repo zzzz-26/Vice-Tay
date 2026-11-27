@@ -366,7 +366,8 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// Our own allocations alive now, by size of block (under 4 KiB, to 64 KiB,
 /// to 1 MiB, larger): bytes, then blocks. "Our own" is the Rust code of
 /// every crate in the process: in diagnostics builds [`Counting`] stands in
-/// front of the system's heap. The memory map's "process heap segments"
+/// front of the selected allocator. With the system allocator, the memory
+/// map's "process heap segments"
 /// hold the blocks under about half a megabyte of ours, of the graphics
 /// runtime and of the driver alike (3.5 GB in run 60's gameplay, growing by
 /// some 2 MB a frame, and nothing said whose): this says which part is
@@ -451,16 +452,21 @@ fn big_blocks() -> String {
     if text.is_empty() { "none".into() } else { text.join(", ") }
 }
 
-/// The system's allocator with every block counted in [`OWN`] (two atomic
+/// The selected allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
 struct Counting;
 
-// SAFETY: every call goes to the system's allocator unchanged; only
+#[cfg(feature = "mimalloc")]
+const INNER: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(not(feature = "mimalloc"))]
+const INNER: std::alloc::System = std::alloc::System;
+
+// SAFETY: every call goes to the selected allocator unchanged; only
 // counters are kept beside it.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        let at = unsafe { INNER.alloc(layout) };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -470,7 +476,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let at = unsafe { INNER.alloc_zeroed(layout) };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -482,12 +488,12 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         own(layout.size(), false);
         big(at, layout.size(), false);
         // SAFETY: the caller's contract, passed on.
-        unsafe { std::alloc::System.dealloc(at, layout) };
+        unsafe { INNER.dealloc(at, layout) };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let moved = unsafe { INNER.realloc(at, layout, size) };
         if !moved.is_null() {
             own(layout.size(), false);
             own(size, true);
@@ -957,7 +963,8 @@ fn log_memory() {
     // code has allocated.
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let window = crate::shadow::window_use();
-    let views = crate::descriptor::views_kept();
+    let (views, [constant, shader, unordered, sampler, console_sampler, placed]) =
+        crate::descriptor::views_kept();
     let own: Vec<u64> = (0..8).map(owned).collect();
     tracing::info!(
         "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
@@ -1018,6 +1025,16 @@ fn log_memory() {
         mb(census[9]),
         mb(kept[6]),
         big_blocks(),
+    );
+    tracing::info!(
+        "memory, view slots (occupied+free, slot MB): constant {}+{} {:.2}, shader {}+{} {:.2}, \
+         unordered {}+{} {:.2}, sampler {}+{} {:.2}, console sampler {}+{} {:.2}, placed {}+{} {:.2}",
+        constant.occupied, constant.free, mb(constant.slot_bytes()),
+        shader.occupied, shader.free, mb(shader.slot_bytes()),
+        unordered.occupied, unordered.free, mb(unordered.slot_bytes()),
+        sampler.occupied, sampler.free, mb(sampler.slot_bytes()),
+        console_sampler.occupied, console_sampler.free, mb(console_sampler.slot_bytes()),
+        placed.occupied, placed.free, mb(placed.slot_bytes()),
     );
     // Round 3: whether windows hold the same memory more than once (they
     // can, once they are cut finer than 4 MiB), and how many host lists

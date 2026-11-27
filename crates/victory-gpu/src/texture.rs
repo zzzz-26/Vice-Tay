@@ -19,6 +19,7 @@ pub(crate) mod ahead;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -289,7 +290,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(placed as usize, to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -304,7 +305,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -811,6 +812,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             }
         }
     }
+    let prefill = copy.prefill.as_ref().and_then(Prefill::claim);
     // The video decoder cycles CPU-written linear plane buffers. Keep a
     // dedicated per-list upload buffer through the list's GPU fence so
     // concurrent frames never overwrite each other or stall on staging hashes.
@@ -826,7 +828,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             once!("no upload buffer for a CPU-written movie plane");
             return;
         };
-        record_upload(list, resource, &copy, &staging, &source, 0);
+        record_upload(list, resource, &copy, &staging, &source, 0, prefill);
         staging.uploaded.store(true, Relaxed);
         return;
     }
@@ -836,7 +838,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // frame was recorded before that check). During a one-shot bake we
     // always record the copy so any change found at submission lands in
     // VRAM before the bake draw executes.
-    if !baking && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    if prefill.is_none() && !baking && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -851,7 +853,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
-    record_upload(list, resource, &copy, &staging, &staging.buffer, staging.base);
+    record_upload(list, resource, &copy, &staging, &staging.buffer, staging.base, prefill);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
@@ -902,6 +904,7 @@ fn record_upload(
     staging: &Staging,
     source: &ID3D12Resource,
     base: u64,
+    prefill: Option<PrefillClaim>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let texture = &copy.texture;
@@ -924,14 +927,8 @@ fn record_upload(
         unsafe { list.list.barriers(&[aliasing]) };
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
-    // A host copy made whole from the store (`crate::texstore`): its larger
-    // levels, once, before the ones from title memory.
-    let prefill = copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some((levels, bytes)) = prefill
-        && prefill_levels(list, copy, levels, &bytes)
-    {
-        let texture = resource as usize;
-        list.defer_host(move || crate::texlate::whole(texture));
+    if let Some(prefill) = prefill {
+        record_prefill(list, texture, resource as usize, staging.memory as u64, prefill);
     }
     // The staging/plane upload buffer lives until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
@@ -1014,19 +1011,67 @@ fn fill_plane(
     });
 }
 
-/// Records copies of levels `0..levels` of `copy` (in the copy destination
-/// state) from `bytes`, laid out as the host lays out those subresources;
-/// its views show them from then on.
-fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: u32, bytes: &[u8]) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    let Some(host) = host() else {
-        return false;
-    };
-    let texture = &copy.texture;
+/// Cached larger levels waiting for a list to upload them.
+pub(crate) struct Prefill {
+    cached: Mutex<Option<(u32, Arc<Vec<u8>>)>>,
+    published: AtomicU32,
+}
+
+impl Prefill {
+    pub(crate) fn new(cached: (u32, Arc<Vec<u8>>)) -> Arc<Self> {
+        Arc::new(Self { cached: Mutex::new(Some(cached)), published: AtomicU32::new(0) })
+    }
+
+    pub(crate) fn published(&self) -> u32 {
+        self.published.load(Ordering::Acquire)
+    }
+
+    fn claim(self: &Arc<Self>) -> Option<PrefillClaim> {
+        if self.published() != 0 {
+            return None;
+        }
+        let (levels, bytes) = self.cached.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        Some(PrefillClaim { owner: self.clone(), levels, bytes, finished: AtomicBool::new(false) })
+    }
+}
+
+/// One recording owns the upload. If the list is reset or runs out of
+/// upload memory before submission, the next recording can retry it.
+struct PrefillClaim {
+    owner: Arc<Prefill>,
+    levels: u32,
+    bytes: Arc<Vec<u8>>,
+    finished: AtomicBool,
+}
+
+impl PrefillClaim {
+    fn publish(&self) -> bool {
+        if self.finished.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        self.owner.published.store(self.levels, Ordering::Release);
+        true
+    }
+}
+
+impl Drop for PrefillClaim {
+    fn drop(&mut self) {
+        if !*self.finished.get_mut() {
+            *self.owner.cached.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.levels, self.bytes.clone()));
+        }
+    }
+}
+
+/// Record the cached levels before the ones from title memory. Publish
+/// them as part of submission, and rebind existing slots after it lands.
+fn record_prefill(list: &HostList, texture: &ID3D12Resource, resource: usize, start: u64, claim: PrefillClaim) {
+    let Some(host) = host() else { return };
+    let levels = claim.levels;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     if levels == 0 || levels > u32::from(d.MipLevels) || d.DepthOrArraySize != 1 {
-        return false;
+        claim.finished.store(true, Ordering::Relaxed);
+        return;
     }
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels as usize];
     let mut total = 0;
@@ -1034,14 +1079,15 @@ fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: 
     unsafe {
         host.device.GetCopyableFootprints(&d, 0, levels, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut total));
     }
-    if total as usize > bytes.len() {
-        return false;
+    if total as usize > claim.bytes.len() {
+        claim.finished.store(true, Ordering::Relaxed);
+        return;
     }
     let Some((buffer, data)) = host.upload_buffer(total) else {
-        return false;
+        return;
     };
     // SAFETY: the mapping holds `total` bytes.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, total as usize) };
+    unsafe { std::ptr::copy_nonoverlapping(claim.bytes.as_ptr(), data, total as usize) };
     list.keep(&buffer);
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -1059,9 +1105,13 @@ fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    copy.prefilled.store(levels, Relaxed);
-    crate::texstore::PREFILLED.fetch_add(1, Relaxed);
-    true
+    list.defer_host(move || {
+        if claim.publish() {
+            crate::texstore::PREFILLED.fetch_add(1, Ordering::Relaxed);
+            crate::texlate::whole(resource);
+            crate::descriptor::host::levels_changed_after(start);
+        }
+    });
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1900,17 +1950,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+        return mapped_texture_blocks(start, end);
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -1926,6 +1966,34 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
             there += (next - p) as u64;
         }
         p = next;
+    }
+    there
+}
+
+/// Counts readable blocks where the runtime has no mapping record. Query
+/// the extent of a hole only after its first failed read.
+fn mapped_texture_blocks(start: usize, end: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    const BLOCK: usize = 64 << 10;
+    let mut there = 0u64;
+    let mut block = start & !(BLOCK - 1);
+    while block < end {
+        let next = block.saturating_add(BLOCK);
+        let lo = block.max(start);
+        block = next;
+        if readable(lo, 1, true).0 == 1 {
+            there += (next.min(end) - lo) as u64;
+            continue;
+        }
+        // SAFETY: queries an address and fills a structure of the right size.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe { VirtualQuery(lo as *const _, &mut info, size_of_val(&info)) };
+        if queried != 0 && (info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0) {
+            let hole_end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+            block = block.max(hole_end.checked_next_multiple_of(BLOCK).unwrap_or(end));
+        }
     }
     there
 }
@@ -1992,7 +2060,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             if crate::residency::upload_refused()
                 || (speculative && !crate::residency::allow_staging_growth(false))
             {
-                crate::residency::note_staging_deferred();
+                crate::residency::note_upload_deferred();
                 return None;
             }
             let (buffer, data) = host.upload_buffer(total)?;
@@ -2170,6 +2238,92 @@ mod title_memory_tests {
     }
 }
 
+#[cfg(test)]
+mod prefill_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    #[test]
+    fn resetting_a_cached_mip_upload_leaves_it_available_until_submission() {
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 2,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        let mut rows = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0;
+        // SAFETY: valid texture and outputs for one subresource.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut texture,
+            ).unwrap();
+            host.device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut rows), None, None, Some(&mut bytes));
+        }
+        let texture = texture.unwrap();
+        let prefill = Prefill::new((1, Arc::new(vec![0x6a; bytes as usize])));
+        let list = host.new_list().unwrap();
+        record_prefill(&list, &texture, 0, 0, prefill.claim().unwrap());
+        assert_eq!(prefill.published(), 0);
+        assert!(prefill.claim().is_none());
+        list.close();
+        list.reset();
+        assert_eq!(prefill.published(), 0);
+
+        record_prefill(&list, &texture, 0, 0, prefill.claim().expect("cached mip survives reset"));
+        let readback = host.read_back_buffer(bytes).unwrap();
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer; texture outlives the operation.
+            pResource: unsafe { std::mem::transmute_copy(&texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer; readback outlives the operation.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: rows },
+        };
+        // SAFETY: the list is open and both resources live through the copy.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(prefill.published(), 1);
+        assert!(prefill.claim().is_none());
+        list.reset();
+        assert!(prefill.claim().is_none());
+
+        let mut data = std::ptr::null_mut();
+        // SAFETY: execute waited for the copy and the mapped buffer holds all four rows.
+        unsafe {
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let read = std::slice::from_raw_parts(data.cast::<u8>(), bytes as usize);
+            for row in 0..4 {
+                let at = row * rows.Footprint.RowPitch as usize;
+                assert_eq!(&read[at..at + 16], &[0x6a; 16]);
+            }
+            readback.Unmap(0, None);
+        }
+    }
+}
+
 /// How long this PC's card takes to make the allocations a staged texture needs, for
 /// `cargo test -p victory-gpu allocation_costs -- --ignored --nocapture`.
 #[cfg(test)]
@@ -2259,6 +2413,31 @@ mod allocation_costs {
             }
             crate::inplace::views_gone(noted, blocks * BLOCK);
         }
+    }
+
+    #[test]
+    fn sparse_texture_blocks_keep_readable_islands_between_holes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: a reservation owned by the test, with separate committed ranges.
+        let (start, end) = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 12 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            for (offset, count, protect) in [
+                (0, 1, PAGE_READWRITE), (5, 1, PAGE_READWRITE),
+                (6, 5, PAGE_NOACCESS), (11, 1, PAGE_READWRITE),
+            ] {
+                let at = base.add(offset * BLOCK).cast();
+                assert_eq!(VirtualAlloc(at, count * BLOCK, MEM_COMMIT, protect), at);
+            }
+            (base as usize, base as usize + 12 * BLOCK)
+        };
+        assert_eq!(super::mapped_texture_blocks(start + 17, end - 31), (3 * BLOCK - 48) as u64);
+        // SAFETY: the test owns the whole reservation and is done reading it.
+        assert_ne!(unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) }, 0);
     }
 
     /// The digest tells every length and every changed byte apart, zeros

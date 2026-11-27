@@ -3,6 +3,8 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(agility_sdk)]
+mod agility;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -13,6 +15,7 @@ mod translate;
 #[cfg(windows)]
 mod warm;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -92,7 +95,7 @@ enum Command {
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
@@ -110,7 +113,7 @@ enum Command {
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// Also write every shader that does not translate to this file,
         /// one line each: hash, where it was found, why.
@@ -124,7 +127,7 @@ enum Command {
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// At most this many pipelines.
         #[arg(long)]
@@ -179,6 +182,13 @@ enum Console {
     SeriesS,
 }
 
+fn parse_jobs(value: &str) -> Result<usize, &'static str> {
+    value
+        .parse::<NonZeroUsize>()
+        .map(NonZeroUsize::get)
+        .map_err(|_| "expected a worker count of 1 or more")
+}
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -187,6 +197,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    #[cfg(agility_sdk)]
+    agility::check_runtime()?;
     match cli.command {
         Command::Inspect {
             file,

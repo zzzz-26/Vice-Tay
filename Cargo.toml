@@ -37,6 +37,7 @@ windows = "0.62.2"
 windows-core = "0.62.2"
 blake3 = "1.8.7"
 memchr = "2.8.3"
+mimalloc = { version = "0.1.52", default-features = false }
 # SIMD-accelerated pure-Rust zlib/deflate (Zlib license, runtime AVX2/SSE4.2 dispatch).
 zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
 walkdir = "2.5.1"

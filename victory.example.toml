@@ -7,6 +7,17 @@
 # Your own dump of the title.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
+# PC FSR upscaler and DLSS fallback.   env: VICTORY_FIDELITYFX_DIR
+# fidelityfx_dir = 'D:\victory-data\fidelityfx-2.4.0\signedbin'
+
+# PC FidelityFX frame generation. Defaults to fidelityfx_dir.
+# env: VICTORY_FFX_FG_DIR
+# ffx_fg_dir = 'D:\victory-data\fidelityfx-2.4.0\signedbin'
+
+# NVIDIA's nvngx_dlss.dll for -Dlss4K (optional: the driver's copy
+# otherwise).   env: VICTORY_DLSS_DIR
+# dlss_dir = 'D:\victory-data\dlss-310.9.16'
+
 # Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
 

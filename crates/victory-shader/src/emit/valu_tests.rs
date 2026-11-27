@@ -2449,6 +2449,113 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
     }
 }
 
+#[test]
+fn typed_store_guards_float_nan_and_infinity_but_keeps_integer_bits() {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_SINT,
+        DXGI_FORMAT_R32G32B32A32_UINT,
+    };
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let input = [0x7fc0_0000, 0x7f80_0000, 0xff80_0000, 1.0f32.to_bits()];
+    let mut body = s_load_dwordx4_off(8, 4, 0).to_vec();
+    for (channel, bits) in input.into_iter().enumerate() {
+        body.extend_from_slice(&[vop1(1, 2 + channel as u8, 0xff), bits]);
+    }
+    // buffer_store_format_xyzw v[2:5], v0, s[8:11], 0 idxen.
+    body.extend_from_slice(&mubuf_idxen(0x07, 2, 0, 8));
+    let shader = build_table_typed_cs(&body, vec![UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 16,
+        dwords: 4,
+        user_data: 4,
+        slot: 0,
+    }]);
+    assert!(shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES));
+    assert!(!shader.root_srvs.contains(&super::SLOT_STRIDES));
+
+    let float_output = [0, 65504.0f32.to_bits(), (-65504.0f32).to_bits(), input[3]];
+    let cases = [
+        (DXGI_FORMAT_R32G32B32A32_UINT, 16 | super::VIEW_INTEGER, input),
+        (DXGI_FORMAT_R32G32B32A32_SINT, 16 | super::VIEW_INTEGER | super::VIEW_SIGNED, input),
+        (DXGI_FORMAT_R32G32B32A32_FLOAT, 16, float_output),
+    ];
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+        for (format, kind, expected) in cases {
+            let output = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize])),
+                    (1, Root::View { srv: true, data: vec![kind] }),
+                ],
+                views: &[View::TypedUav { data: &[0; 16], format, elem_bytes: 16 }],
+                samplers: &[],
+                groups: [1, 1, 1],
+            }).unwrap_or_else(|error| panic!("{backend} {format:?}: {error}"));
+            assert_eq!(output[0], expected.repeat(4), "{backend} {format:?}");
+        }
+    }
+}
+
+#[test]
+fn typed_store_preserves_bits_when_the_view_kind_is_unavailable() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_UINT;
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let input = [0x7fc0_0000, 0x7f80_0000, 0xff80_0000, 0x4123_4567];
+    let mut body = s_load_dwordx4_off(8, 4, 0).to_vec();
+    body.extend_from_slice(&s_load_dwordx4_off(12, 4, 32));
+    body.extend_from_slice(&[
+        0xBF06_8004, // s_cmp_eq_u32 s4, 0
+        0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
+        0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
+    ]);
+    for (channel, bits) in input.into_iter().enumerate() {
+        body.extend_from_slice(&[vop1(1, 2 + channel as u8, 0xff), bits]);
+    }
+    body.extend_from_slice(&mubuf_idxen(0x07, 2, 0, 16));
+    let used = (0..2)
+        .map(|slot| UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: slot * 8,
+            lower_bound: slot,
+            stride: 16,
+            dwords: 4,
+            user_data: 4,
+            slot: 0,
+        })
+        .collect();
+    let shader = build_table_typed_cs(&body, used);
+    assert!(!shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES));
+
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+        let views = [(); 2].map(|()| View::TypedUav {
+            data: &[0; 16],
+            format: DXGI_FORMAT_R32G32B32A32_UINT,
+            elem_bytes: 16,
+        });
+        let output = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|error| panic!("{backend}: {error}"));
+        assert_eq!(output[0], input.repeat(4), "{backend}");
+        assert_eq!(output[1], [0; 16], "{backend}: unselected view");
+    }
+}
+
 /// Non-`d16` typed loads (`buffer_load_format_x`) are used by
 /// `CS_BlendshapeTranslationsHSSGraphOutputExtract` (reading `HSSGraphOut`
 /// `R16_UINT`) and `CS_PedStandardSkinning_*` (reading bone indices). Verify

@@ -479,8 +479,8 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+#[cfg(windows)]
+pub(super) fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -499,20 +499,32 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+#[cfg(windows)]
+pub(super) fn skip_hashes() -> &'static [String] {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(windows)]
+pub(super) fn skipped_in_list<'a>(
+    shaders: &'a [std::sync::Arc<Shader>],
+    hashes: &[String],
+) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    skipped_in_list(&p.shaders, skip_hashes())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -553,6 +565,18 @@ pub(crate) enum PrepareFailure {
     RootUavSlot,
     RootSrvHeap,
     RootSrvSlot,
+}
+
+/// A failed direct draw or mesh preparation in a frame operation capture.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn direct_prepare_text(this: This, command: &str, why: PrepareFailure) -> String {
+    if this.is_null() {
+        return format!("DROPPED {command} preparation reason={why:?} recipe_key=none");
+    }
+    let pipeline = pipeline(this);
+    let key = pipeline.host.key();
+    let shaders: Vec<_> = pipeline.shaders.iter().map(|s| (s.stage, s.hash.as_str())).collect();
+    format!("DROPPED {command} preparation reason={why:?} recipe_key={key} guest_shaders={shaders:?}")
 }
 
 /// Keep the first example of each failure per recipe, with room for every
@@ -877,6 +901,20 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn direct_prepare_capture_identifies_an_unset_pipeline() {
+        let line = super::direct_prepare_text(
+            std::ptr::null_mut(),
+            "mesh",
+            super::PrepareFailure::MissingHostPipeline,
+        );
+        assert_eq!(
+            line,
+            "DROPPED mesh preparation reason=MissingHostPipeline recipe_key=none"
+        );
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn indirect_prepare_examples_preserve_each_command_kind() {

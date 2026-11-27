@@ -20,10 +20,11 @@ pub(crate) fn on() -> bool {
 }
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=1, b0, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
+cbuffer Plane : register(b0) { uint mode; };
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
 [RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
@@ -35,10 +36,64 @@ V vs(uint id : SV_VertexID) {
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+    if (mode == 1) return float4(saturate(s.rgb), 1);
+    if (mode == 2) return saturate(s);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
     return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
 }
 "#;
+
+type View<'a> = (&'a ID3D12Resource, DXGI_FORMAT);
+
+pub(crate) enum Picture<'a> {
+    Composed(View<'a>, View<'a>),
+    Scene(View<'a>),
+    Overlay(View<'a>),
+}
+
+pub(crate) const UI_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
+pub(crate) const UI_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
+);
+
+/// Two images allow the proxy to read the previous UI asynchronously while
+/// the current Present records another. Present waits for the previous UI
+/// composition before returning, so its image can be reused next time.
+pub(crate) struct UiFrames {
+    pub(crate) size: (u32, u32),
+    pub(crate) images: [ID3D12Resource; 2],
+}
+
+impl UiFrames {
+    pub(crate) fn new(host: &Host, size: (u32, u32)) -> Option<Self> {
+        let create = || {
+            let mut texture = None;
+            // SAFETY: a default-heap RGBA render target for one UI image.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: u64::from(size.0),
+                        Height: size.1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: UI_FORMAT,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    UI_READ,
+                    None,
+                    &mut texture,
+                ).ok()?;
+            }
+            texture
+        };
+        Some(Self { size, images: [create()?, create()?] })
+    }
+}
 
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
@@ -130,10 +185,15 @@ impl Composer {
         host: &Host,
         slot: usize,
         list: &ID3D12GraphicsCommandList,
-        planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
+        picture: Picture<'_>,
         back: &ID3D12Resource,
         (width, height): (u32, u32),
     ) -> windows::core::Result<()> {
+        let (mode, planes) = match picture {
+            Picture::Composed(scene, overlay) => (0, [scene, overlay]),
+            Picture::Scene(scene) => (1, [scene, scene]),
+            Picture::Overlay(overlay) => (2, [overlay, overlay]),
+        };
         while self.views.len() <= slot {
             let heap = unsafe {
                 host.device
@@ -178,6 +238,7 @@ impl Composer {
             list.SetGraphicsRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
             list.SetGraphicsRootDescriptorTable(0, gpu);
+            list.SetGraphicsRoot32BitConstant(1, mode, 0);
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
@@ -270,6 +331,8 @@ mod tests {
         let base = texture(1);
         let overlay = texture(3);
         let output = texture(3);
+        let scene_output = texture(3);
+        let ui_output = texture(3);
         let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let cmds = &list.list;
@@ -299,36 +362,37 @@ mod tests {
                     host,
                     0,
                     cmds,
-                    [(&base, format), (&overlay, format)],
+                    Picture::Composed((&base, format), (&overlay, format)),
                     &output,
                     (3, 1),
                 )
                 .unwrap();
-            cmds.ResourceBarrier(&[crate::host::transition(
-                &output,
-                target,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            let (buffer, footprint) =
-                crate::capture::read_back(&host.device, cmds, &output).unwrap();
+            compositor.record(host, 1, cmds, Picture::Scene((&base, format)), &scene_output, (3, 1)).unwrap();
+            compositor.record(host, 2, cmds, Picture::Overlay((&overlay, format)), &ui_output, (3, 1)).unwrap();
+            let outputs = [&output, &scene_output, &ui_output];
+            cmds.ResourceBarrier(&outputs.map(|output| crate::host::transition(
+                output, target, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )));
+            let readbacks = outputs.map(|output| crate::capture::read_back(&host.device, cmds, output).unwrap());
             list.close();
             host.execute(&[&list]);
             host.device.GetDeviceRemovedReason().unwrap();
-            let mut mapped = std::ptr::null_mut();
-            buffer.Map(0, None, Some(&mut mapped)).unwrap();
-            let start = mapped.cast::<u8>().add(footprint.Offset as usize);
-            let pixels: [u8; 12] = std::slice::from_raw_parts(start, 12).try_into().unwrap();
-            buffer.Unmap(0, None);
-            for (actual, expected) in pixels
-                .iter()
-                .zip([128, 0, 0, 255, 64, 128, 0, 255, 0, 0, 255, 255])
-            {
-                assert!(
-                    actual.abs_diff(expected) <= 1,
-                    "unexpected composite {pixels:?}"
-                );
+            let expected = [
+                [128, 0, 0, 255, 64, 128, 0, 255, 0, 0, 255, 255],
+                [128, 0, 0, 255, 128, 0, 0, 255, 128, 0, 0, 255],
+                [0, 0, 0, 0, 0, 128, 0, 128, 0, 0, 255, 255],
+            ];
+            for ((buffer, footprint), expected) in readbacks.into_iter().zip(expected) {
+                let mut mapped = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let start = mapped.cast::<u8>().add(footprint.Offset as usize);
+                let pixels: [u8; 12] = std::slice::from_raw_parts(start, 12).try_into().unwrap();
+                buffer.Unmap(0, None);
+                for (actual, expected) in pixels.iter().zip(expected) {
+                    assert!(actual.abs_diff(expected) <= 1, "unexpected plane {pixels:?}");
+                }
+                eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
             }
-            eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
         }
     }
 }

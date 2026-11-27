@@ -1,10 +1,10 @@
 //! Diagnostics: the run's numbers on the picture (`VICTORY_PANEL=1`; off by
-//! default; F3 shows and hides it while our window has the focus): a sleek
-//! dark HUD in the upper left corner with large coloured FPS, live frame-time
-//! graph, GPU/VRAM/RAM stats and per-core CPU bars, so that a screenshot
-//! carries them. Refreshed up to four times a second from the frame-rate
-//! line, memory and textures; a frame itself only copies the box out of a
-//! buffer in the card's memory onto the swap chain's buffer.
+//! default; F3 shows and hides it while our window has the focus). Rendered
+//! FPS, measured output FPS and render frame time lead the panel. The graph
+//! marks the 30 FPS budget; hardware and memory figures follow it.
+//! Refreshed up to four times a second from the frame-rate
+//! line, memory and textures. The proxy swap chain composites the panel as
+//! a separate UI texture when AMD frame generation is active.
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -27,8 +27,8 @@ const EVERY: Duration = Duration::from_millis(250);
 const GLYPH: (u32, u32) = (5, 7);
 
 /// Logical canvas dimensions (1x at <=1600p, 2x at 4K).
-const BASE_W: u32 = 540;
-const BASE_H: u32 = 334;
+const BASE_W: u32 = 560;
+const BASE_H: u32 = 348;
 
 /// How many recent frames the live frame-time graph keeps.
 const HISTORY: usize = 172;
@@ -37,22 +37,30 @@ const HISTORY: usize = 172;
 const UPLOADS: usize = 4;
 
 // Palette (sRGB 0..255).
-const BG: [u8; 3] = [18, 20, 25];
-const BORDER: [u8; 3] = [56, 62, 74];
-const GRAPH_BG: [u8; 3] = [11, 13, 17];
-const GRAPH_GRID: [u8; 3] = [44, 48, 58];
-const GRAPH_FLOOR: [u8; 3] = [112, 62, 34];
-const BAR_BG: [u8; 3] = [34, 38, 46];
-const BAR_FILL_LO: [u8; 3] = [88, 212, 232];
-const BAR_FILL_HI: [u8; 3] = [116, 178, 252];
-const LABEL: [u8; 3] = [108, 178, 252];
-const WHITE: [u8; 3] = [240, 243, 248];
-const MUTED: [u8; 3] = [170, 178, 192];
-const SEP: [u8; 3] = [96, 104, 118];
-const GREEN: [u8; 3] = [138, 236, 72];
-const YELLOW: [u8; 3] = [245, 208, 66];
-const ORANGE: [u8; 3] = [246, 134, 54];
-const RED: [u8; 3] = [242, 76, 66];
+const BG: [u8; 3] = [24, 20, 36];
+const HEADER_BG: [u8; 3] = [37, 28, 48];
+const BORDER: [u8; 3] = [82, 69, 96];
+const GRAPH_BG: [u8; 3] = [18, 15, 29];
+const GRAPH_TARGET: [u8; 3] = [165, 145, 194];
+const GRAPH_FILL: [u8; 3] = [73, 57, 87];
+const PINK: [u8; 3] = [250, 165, 212];
+const LILAC: [u8; 3] = [209, 186, 248];
+const BLUE: [u8; 3] = [151, 211, 255];
+// Mint is reserved for the measured output FPS digits.
+const FG_MINT: [u8; 3] = [134, 255, 170];
+const AMBER: [u8; 3] = [255, 194, 106];
+const RED: [u8; 3] = [255, 130, 140];
+const WHITE: [u8; 3] = [255, 248, 245];
+const MUTED: [u8; 3] = [205, 193, 215];
+const FRAME_BUDGET_MS: f32 = 1000.0 / 30.0;
+
+/// Pink, lilac and blue mark the frame history from oldest to newest.
+fn accent(position: u32, last: u32) -> [u8; 3] {
+    let last = last.max(1);
+    let t = 2 * position.min(last);
+    let (from, to, t) = if t <= last { (PINK, LILAC, t) } else { (LILAC, BLUE, t - last) };
+    std::array::from_fn(|i| ((u32::from(from[i]) * (last - t) + u32::from(to[i]) * t) / last) as u8)
+}
 
 fn asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -219,36 +227,36 @@ impl Canvas {
         self.rect(x + w - 1, y, 1, h, color);
     }
 
-    /// Draws `text` at `(x, y)` with integer glyph pixel size `px` (`2` => 10x14).
-    /// Returns the ending `x` coordinate.
-    fn text(&mut self, mut x: u32, y: u32, px: u32, color: [u8; 3], text: &str) -> u32 {
-        let step = (GLYPH.0 + 1) * px;
+    /// Body text uses square pixels; headings are taller, tighter and slightly slanted.
+    fn lettering(&mut self, mut x: u32, y: u32, (sx, sy): (u32, u32), color: [u8; 3], text: &str, display: bool) -> u32 {
+        let gap = if display { (sx / 2).max(1) } else { sx };
         for ch in text.bytes() {
-            let bits = glyph(ch.to_ascii_uppercase());
-            for (row, &mask) in bits.iter().enumerate() {
-                if mask == 0 {
-                    continue;
-                }
+            for (row, mask) in glyph(ch.to_ascii_uppercase()).into_iter().enumerate() {
+                let row = row as u32;
+                let lean = if display { (GLYPH.1 - 1 - row) * sx / GLYPH.1 } else { 0 };
                 for col in 0..GLYPH.0 {
-                    if (mask >> (GLYPH.0 - 1 - col)) & 1 != 0 {
-                        self.rect(x + col * px, y + row as u32 * px, px, px, color);
+                    if mask & (1 << (GLYPH.0 - 1 - col)) != 0 {
+                        self.rect(x + lean + col * sx, y + row * sy, sx, sy, color);
                     }
                 }
             }
-            x += step;
+            x += GLYPH.0 * sx + gap;
         }
         x
     }
 
-    /// Draws `text` with `|` separators rendered in `SEP`.
-    fn text_sep(&mut self, mut x: u32, y: u32, px: u32, color: [u8; 3], text: &str) -> u32 {
-        for (i, part) in text.split('|').enumerate() {
-            if i > 0 {
-                x = self.text(x, y, px, SEP, "|");
-            }
-            x = self.text(x, y, px, color, part);
-        }
-        x
+    fn text(&mut self, x: u32, y: u32, px: u32, color: [u8; 3], text: &str) -> u32 {
+        self.lettering(x, y, (px, px), color, text, false)
+    }
+
+    fn heading(&mut self, x: u32, y: u32, color: [u8; 3], text: &str) {
+        self.lettering(x, y, (2, 3), color, text, true);
+    }
+
+    fn text_right(&mut self, right: u32, y: u32, px: u32, color: [u8; 3], text: &str) -> u32 {
+        let left = right.saturating_sub(text.len() as u32 * (GLYPH.0 + 1) * px);
+        self.text(left, y, px, color, text);
+        left
     }
 
     /// Packs the logical canvas scaled by `scale` into swap-chain bytes.
@@ -462,6 +470,7 @@ impl Counters {
 /// Snapshot of data rendered onto the HUD canvas.
 struct Snapshot {
     fps: f64,
+    frame_rates: Option<(f32, f32)>,
     frame_ms: f64,
     gpu_ms: f64,
     gpu_pct: u32,
@@ -492,158 +501,178 @@ struct Snapshot {
     history_ms: Vec<f32>,
 }
 
-fn fps_color(fps: f64) -> [u8; 3] {
-    if fps >= 25.0 {
-        GREEN
-    } else if fps >= 14.0 {
-        YELLOW
-    } else {
-        ORANGE
+/// Fits the value within one headline column even during loading-screen FPS spikes.
+fn headline(c: &mut Canvas, x: u32, value: f64, color: [u8; 3]) {
+    let digits = if value < 100.0 { format!("{value:.1}") } else { format!("{value:.0}") };
+    let px = (174 / (digits.len() as u32 * (GLYPH.0 + 1))).clamp(2, 5);
+    c.lettering(x, 68 - GLYPH.1 * px, (px.saturating_sub(1).max(2), px), color, &digits, true);
+}
+
+fn paint_history(c: &mut Canvas, history: &[f32]) {
+    let (x, y, w, h) = (14, 100, 320, 52);
+    let panel_bottom = y + h - 1;
+    c.rect(x, y, w, h, GRAPH_BG);
+    let peak = history.iter().copied().fold(0.0f32, f32::max);
+    let ceiling = if peak <= FRAME_BUDGET_MS * 2.0 { FRAME_BUDGET_MS * 2.0 }
+        else if peak <= FRAME_BUDGET_MS * 4.0 { FRAME_BUDGET_MS * 4.0 }
+        else { peak.min(1000.0) };
+    let to_height = |ms: f32| ((ms / ceiling).clamp(0.0, 1.0) * (h - 2) as f32).round() as u32;
+
+    // Fixed time order: the newest frame is at the right edge, even at startup.
+    let n = history.len().min(HISTORY);
+    for (i, &ms) in history[history.len() - n..].iter().enumerate() {
+        let slot = (HISTORY - n + i) as u32;
+        let left = x + slot * w / HISTORY as u32;
+        let right = x + (slot + 1) * w / HISTORY as u32;
+        let height = to_height(ms).max(1);
+        let top = panel_bottom - height;
+        c.rect(left, top, right - left, height, GRAPH_FILL);
+        let color = if ms <= FRAME_BUDGET_MS { accent(slot, HISTORY as u32 - 1) } else if ms <= FRAME_BUDGET_MS * 2.0 { AMBER } else { RED };
+        c.rect(left, top, right - left, height.min(2), color);
+    }
+    let target = panel_bottom - to_height(FRAME_BUDGET_MS);
+    for dx in (0..w).step_by(8) {
+        c.rect(x + dx, target, 4, 1, GRAPH_TARGET);
     }
 }
 
-fn frametime_color(ms: f32) -> [u8; 3] {
-    if ms <= 38.0 {
-        GREEN
-    } else if ms <= 72.0 {
-        YELLOW
-    } else if ms <= 115.0 {
-        ORANGE
-    } else {
-        RED
+fn device_row(c: &mut Canvas, y: u32, label: &str, name: &str, load: &str, color: [u8; 3]) {
+    c.heading(14, y.saturating_sub(2), color, label);
+    let value_x = c.text_right(BASE_W - 12, y, 2, color, load);
+    let chars = (value_x.saturating_sub(76) / 12) as usize;
+    // The HUD font is ASCII. Skip trademark symbols and shorten model names on character boundaries.
+    let name: String = name.chars().filter(char::is_ascii).take(chars).collect();
+    c.text(66, y, 2, WHITE, &name);
+}
+
+/// A stepped outline fits the rectangular copy without covering the readouts.
+fn panel_frame(c: &mut Canvas) {
+    const CUT: u32 = 8;
+    c.rect(CUT, 0, BASE_W - 2 * CUT, 2, BORDER);
+    c.rect(CUT, BASE_H - 2, BASE_W - 2 * CUT, 2, BORDER);
+    c.rect(0, CUT, 2, BASE_H - 2 * CUT, BORDER);
+    c.rect(BASE_W - 2, CUT, 2, BASE_H - 2 * CUT, BORDER);
+    for y in (0..CUT).step_by(2) {
+        let x = CUT - y - 2;
+        for left in [x, BASE_W - x - 4] {
+            c.rect(left, y, 4, 2, BORDER);
+            c.rect(left, BASE_H - y - 2, 4, 2, BORDER);
+        }
     }
 }
 
-fn trunc(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_owned() } else { s[..max].to_owned() }
+/// The raised pair of outlines marks observed generation; a single outline is the idle state.
+fn output_card(c: &mut Canvas, measured: bool) {
+    c.rect(188, 6, 178, 76, BG);
+    c.rect(194, 12, 178, 76, BG);
+    c.rect(188, 4, 178, 2, BORDER);
+    c.rect(366, 6, 3, 3, BORDER);
+    c.rect(369, 9, 3, 3, BORDER);
+    c.rect(372, 12, 2, 76, BORDER);
+    c.rect(194, 88, 180, 2, BORDER);
+    c.rect(191, 85, 3, 3, BORDER);
+    c.rect(188, 82, 3, 3, BORDER);
+    c.rect(186, 6, 2, 76, BORDER);
+
+    c.border(347, 13, 12, 9, MUTED);
+    if measured {
+        c.rect(352, 17, 13, 10, BG);
+        c.border(352, 17, 13, 10, MUTED);
+    }
 }
 
-/// Paints the full colour HUD canvas.
-fn paint_hud(s: &Snapshot) -> Canvas {
+fn paint_hud(s: &Snapshot, framegen: bool) -> Canvas {
     let mut c = Canvas::new(BASE_W, BASE_H, BG);
-    c.border(0, 0, BASE_W, BASE_H, BORDER);
-
-    // 1. Large coloured FPS header.
-    let fps_str = format!("{:.0} FPS", s.fps.round());
-    c.text(14, 12, 4, fps_color(s.fps), &fps_str);
-    // Subtle FPS decimal & ms badge on the right of the header.
-    let badge = format!("{:.1} FPS", s.fps);
-    c.text(BASE_W - 14 - badge.len() as u32 * 12, 24, 2, MUTED, &badge);
-
-    // 2. Resolution | draws | GPU ms.
-    let row2 = format!("{}X{} | {} DRAWS | GPU EST {:.1}MS", s.width, s.height, s.draws, s.gpu_ms);
-    c.text_sep(14, 48, 2, WHITE, &trunc(&row2, 43));
-
-    // 3. Frame | submit | 1% low | max.
-    let row3 = format!(
-        "FRAME {:.1} | SUB {:.1} | 1% {:.0} | MAX {:.0}",
-        s.frame_ms, s.submit_ms, s.low1_fps, s.max_ms
-    );
-    c.text_sep(14, 68, 2, MUTED, &trunc(&row3, 43));
-
-    // 4. Live frame-time sparkline graph.
-    let (gx, gy, gw, gh) = (12u32, 90u32, BASE_W - 24, 76u32);
-    c.rect(gx, gy, gw, gh, GRAPH_BG);
-    c.border(gx, gy, gw, gh, BORDER);
-
-    // Scale graph ceiling dynamically (min 100 ms, up to 200 ms if spikes exist).
-    let peak = s.history_ms.iter().copied().fold(100.0f32, f32::max).min(220.0);
-    let max_scale = if peak > 140.0 { 200.0 } else if peak > 90.0 { 133.0 } else { 100.0 };
-
-    // Reference lines at 33 ms (30 FPS) and 66 ms (15 FPS).
-    for &ref_ms in &[33.3f32, 66.7f32] {
-        if ref_ms < max_scale {
-            let ly = gy + gh - 2 - ((ref_ms / max_scale) * (gh - 4) as f32) as u32;
-            c.rect(gx + 1, ly, gw - 2, 1, GRAPH_GRID);
-            c.text(gx + 4, ly.saturating_sub(8), 1, MUTED, &format!("{:.0}", ref_ms));
-        }
+    let right = BASE_W - 12;
+    c.rect(8, 2, BASE_W - 16, 90, HEADER_BG);
+    c.rect(2, 8, BASE_W - 4, 84, HEADER_BG);
+    for x in (12..BASE_W - 12).step_by(4) {
+        let w = (BASE_W - 12 - x).min(4);
+        c.rect(x, 3, w, 2, accent(x - 12, BASE_W - 25));
     }
+    panel_frame(&mut c);
 
-    // Bars (3 px wide each, right-aligned so newest frame is on the right).
-    let bar_w = 3u32;
-    let slots = (gw - 4) / bar_w;
-    let n = s.history_ms.len().min(slots as usize);
-    let start_x = gx + gw - 2 - (n as u32) * bar_w;
-    for (i, &ms) in s.history_ms[s.history_ms.len() - n..].iter().enumerate() {
-        let frac = (ms / max_scale).clamp(0.02, 1.0);
-        let h = ((frac * (gh - 4) as f32) as u32).max(2);
-        let bx = start_x + i as u32 * bar_w;
-        let by = gy + gh - 2 - h;
-        let top_col = frametime_color(ms);
-        // Warm base fill + crisp coloured cap/spike (matches reference style).
-        let cap = h.min(if ms > 72.0 { h } else { 5 });
-        if h > cap {
-            c.rect(bx, by + cap, bar_w - 1, h - cap, GRAPH_FLOOR);
-        }
-        c.rect(bx, by, bar_w - 1, cap, top_col);
-    }
-
-    // 5. Hardware & memory rows.
-    let val_x = 104u32;
-    let max_chars = ((BASE_W - val_x - 10) / 12) as usize;
-
-    // GPU
-    c.text(14, 176, 2, LABEL, "GPU");
-    let source = if s.gpu_measured { "APP" } else { "EST" };
-    let load = format!("{source} {}%", s.gpu_pct);
-    let gpu_line = format!("{} {load}", trunc(&s.gpu_name, max_chars.saturating_sub(load.len() + 1)));
-    c.text(val_x, 176, 2, WHITE, &trunc(&gpu_line, max_chars));
-
-    // VRAM
-    c.text(14, 196, 2, LABEL, "VRAM");
-    let vram_col = if s.vram_budget_gb > 0.0 && s.vram_used_gb / s.vram_budget_gb >= 0.92 {
-        ORANGE
+    let rates = s.frame_rates.filter(|_| framegen);
+    output_card(&mut c, rates.is_some());
+    let fps = rates.map_or(s.fps, |(rendered, _)| f64::from(rendered));
+    c.heading(14, 8, WHITE, "RENDER FPS");
+    if rates.is_some() {
+        c.heading(198, 8, WHITE, "FG OUTPUT FPS");
     } else {
-        WHITE
-    };
-    let vram_line = format!(
-        "{:.1}/{:.1} GB | SHR {:.1} GB",
-        s.vram_used_gb, s.vram_budget_gb, s.vram_shared_gb
-    );
-    c.text_sep(val_x, 196, 2, vram_col, &trunc(&vram_line, max_chars));
-
-    // VRAM breakdown (Render Targets | Textures/Pool | Card Buffers | BVH Arenas | Other/Driver)
-    let vram_detail = format!(
-        "RT {:.1} | TX {:.1} | BF {:.1} | BV {:.1} | O {:.1}",
-        s.vram_rt_gb, s.vram_tex_gb, s.vram_buf_gb, s.vram_bvh_gb, s.vram_oth_gb
-    );
-    c.text_sep(14, 216, 2, MUTED, &trunc(&vram_detail, 43));
-
-    // CPU + per-core bars
-    c.text(14, 236, 2, LABEL, "CPU");
-    let cpu_line = format!("{} {:.0}%", trunc(&s.cpu_name, max_chars.saturating_sub(5)), s.cpu_pct);
-    c.text(val_x, 236, 2, WHITE, &trunc(&cpu_line, max_chars));
-
-    let cores = s.cores_pct.len().clamp(1, 32);
-    let area_w = BASE_W - val_x - 14;
-    let gap = 2u32;
-    let cw = ((area_w + gap) / cores as u32).saturating_sub(gap).max(4);
-    let bar_h = 22u32;
-    let bar_y = 256u32;
-    for (i, &pct) in s.cores_pct.iter().take(cores).enumerate() {
-        let bx = val_x + i as u32 * (cw + gap);
-        c.rect(bx, bar_y, cw, bar_h, BAR_BG);
-        let fh = ((pct / 100.0) * bar_h as f32).round() as u32;
-        if fh > 0 {
-            let fh = fh.min(bar_h);
-            let col = if pct >= 85.0 { BAR_FILL_HI } else { BAR_FILL_LO };
-            c.rect(bx, bar_y + bar_h - fh, cw, fh, col);
+        c.heading(198, 8, MUTED, "OUTPUT FPS");
+    }
+    c.heading(382, 8, WHITE, "FRAME MS");
+    let pace = if fps >= 30.0 { PINK } else if fps >= 15.0 { AMBER } else { RED };
+    headline(&mut c, 14, fps, pace);
+    if let Some((_, output)) = rates {
+        headline(&mut c, 198, f64::from(output), FG_MINT);
+    } else {
+        c.text(198, 40, 2, MUTED, if framegen { "NO SAMPLE" } else { "RENDER ONLY" });
+    }
+    headline(&mut c, 382, s.frame_ms, WHITE);
+    c.text(14, 72, 2, MUTED, &format!("1% LOW {:.0}", s.low1_fps));
+    let size_end = c.text(198, 72, 2, WHITE, &format!("{}X{}", s.width, s.height));
+    // Output divided by rendered FPS, both measured over the same interval.
+    if let Some((rendered, output)) = rates
+        && rendered > 0.0
+    {
+        let ratio = format!("{:.1}X", output / rendered);
+        if size_end + 6 + ratio.len() as u32 * 12 <= 366 {
+            c.text_right(366, 72, 2, MUTED, &ratio);
         }
     }
+    c.text(382, 72, 2, MUTED, &format!("MAX {:.0} MS", s.max_ms));
 
-    // VICTORY
-    c.text(14, 288, 2, LABEL, "VICTORY");
-    let vic_line = format!("RAM {:.1} GB | DROP {}", s.proc_ram_gb, s.dropped);
-    c.text_sep(val_x, 288, 2, WHITE, &trunc(&vic_line, max_chars));
+    paint_history(&mut c, &s.history_ms);
+    c.text(350, 102, 2, MUTED, "SUBMIT");
+    c.text_right(right, 102, 2, WHITE, &format!("{:.1} MS", s.submit_ms));
+    c.text(350, 132, 2, MUTED, "GPU EST");
+    c.text_right(right, 132, 2, WHITE, &format!("{:.1} MS", s.gpu_ms));
+    c.text(14, 161, 2, MUTED, "33.3 MS TARGET");
+    c.text_right(right, 161, 2, MUTED, &format!("{} DRAWS / {} DROPPED", s.draws, s.dropped));
+    c.rect(14, 183, BASE_W - 28, 1, BORDER);
 
-    // RAM
-    c.text(14, 308, 2, LABEL, "RAM");
-    let ram_line = format!(
-        "{:.1}/{:.1} GB | CMT {:.1}",
-        s.sys_ram_used_gb, s.sys_ram_total_gb, s.sys_commit_gb
-    );
-    c.text_sep(val_x, 308, 2, WHITE, &trunc(&ram_line, max_chars));
+    let gpu_source = if s.gpu_measured { "APP" } else { "EST" };
+    device_row(&mut c, 192, "GPU", &s.gpu_name, &format!("{gpu_source} {}%", s.gpu_pct), BLUE);
+    c.heading(14, 212, BLUE, "VRAM");
+    let local = if s.vram_budget_gb > 0.0 {
+        format!("{:.1}/{:.1} GIB", s.vram_used_gb, s.vram_budget_gb)
+    } else {
+        "N/A".to_owned()
+    };
+    let vram_color = if s.vram_budget_gb > 0.0 && s.vram_used_gb >= 0.92 * s.vram_budget_gb { PINK } else { WHITE };
+    c.text(78, 214, 2, vram_color, &local);
+    c.text_right(right, 214, 2, MUTED, &format!("SHARED {:.1} GIB", s.vram_shared_gb));
+    for (x, label, value) in [
+        (14, "RT", s.vram_rt_gb), (106, "TEX", s.vram_tex_gb), (210, "BUF", s.vram_buf_gb),
+        (314, "BVH", s.vram_bvh_gb), (414, "OTHER", s.vram_oth_gb),
+    ] {
+        c.text(x, 236, 2, MUTED, &format!("{label} {value:.1}"));
+    }
 
+    let cpu_load = if s.cores_pct.is_empty() { "NO SAMPLE".to_owned() } else { format!("SYSTEM {:.0}%", s.cpu_pct) };
+    device_row(&mut c, 263, "CPU", &s.cpu_name, &cpu_load, LILAC);
+    let width = BASE_W - 28;
+    for (i, &pct) in s.cores_pct.iter().enumerate() {
+        let left = 14 + i as u32 * width / s.cores_pct.len() as u32;
+        let right = 14 + (i + 1) as u32 * width / s.cores_pct.len() as u32;
+        let w = (right - left).saturating_sub(2);
+        let fill = (pct.clamp(0.0, 100.0) * 0.14).round() as u32;
+        c.rect(left, 282, w, 14, GRAPH_FILL);
+        c.rect(left, 296 - fill, w, fill, accent(i as u32, s.cores_pct.len().saturating_sub(1) as u32));
+    }
+
+    c.heading(14, 303, LILAC, "RAM");
+    c.text(66, 305, 2, WHITE, &format!("PRIVATE {:.1} GIB", s.proc_ram_gb));
+    c.text_right(right, 305, 2, MUTED, &format!("COMMIT {:.1} GIB", s.sys_commit_gb));
+    c.text(66, 327, 2, MUTED, &format!("SYSTEM {:.1}/{:.1} GIB", s.sys_ram_used_gb, s.sys_ram_total_gb));
+    let mem_width = 158;
+    c.rect(right - mem_width, 332, mem_width, 4, GRAPH_FILL);
+    if s.sys_ram_total_gb > 0.0 {
+        let used = (s.sys_ram_used_gb / s.sys_ram_total_gb).clamp(0.0, 1.0);
+        let fill = (used * f64::from(mem_width)).round() as u32;
+        c.rect(right - mem_width, 332, fill, 4, if used >= 0.92 { PINK } else { LILAC });
+    }
     c
 }
 
@@ -697,9 +726,9 @@ impl Buffers {
         Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, upload_fences: [0; UPLOADS], card_fence: 0, uploaded: false })
     }
 
-    fn write(&mut self, snap: &Snapshot, completed: u64) -> Option<usize> {
+    fn write(&mut self, snap: &Snapshot, completed: u64, framegen: bool) -> Option<usize> {
         let slot = free_upload(&self.upload_fences, self.turn, completed)?;
-        let picture = paint_hud(snap).pack(self.scale, self.format, self.pitch as usize);
+        let picture = paint_hud(snap, framegen).pack(self.scale, self.format, self.pitch as usize);
         self.turn = slot;
         // SAFETY: the mapping holds the picture and its previous GPU read has finished.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[slot].1, picture.len()) };
@@ -711,9 +740,23 @@ fn free_upload(fences: &[u64; UPLOADS], turn: usize, completed: u64) -> Option<u
     (1..=UPLOADS).map(|offset| (turn + offset) % UPLOADS).find(|&slot| fences[slot] <= completed)
 }
 
-/// The present list reads the card buffer, and on a refresh one upload too.
+use crate::compose::{UI_FORMAT, UI_READ, UiFrames};
+
+struct PanelUi {
+    frames: UiFrames,
+    current: Option<usize>,
+}
+
+pub(super) enum Target<'a> {
+    BackBuffer,
+    SeparateUi,
+    GameUi(&'a ID3D12Resource),
+}
+
+/// A panel update uses an upload and can supply a separate UI texture.
 pub(super) struct PanelCopy {
     upload: Option<usize>,
+    pub(super) ui: Option<ID3D12Resource>,
 }
 
 /// The panel of a presenter.
@@ -731,6 +774,7 @@ pub(super) struct Panel {
     snap: Option<Snapshot>,
     changed: bool,
     buffers: Option<Buffers>,
+    ui: Option<PanelUi>,
     failed: bool,
 }
 
@@ -750,6 +794,7 @@ impl Panel {
             snap: None,
             changed: false,
             buffers: None,
+            ui: None,
             failed: false,
         }
     }
@@ -824,6 +869,7 @@ impl Panel {
 
         self.snap = Some(Snapshot {
             fps,
+            frame_rates: crate::framegen::frame_rates(),
             frame_ms: ms,
             gpu_ms,
             gpu_pct,
@@ -858,8 +904,8 @@ impl Panel {
         self.cost = now.elapsed();
     }
 
-    /// Records the copy of the box onto `back`, a buffer of the swap chain of
-    /// that size and format in the state to be copied into.
+    /// Copies the box to the back buffer, or to AMD's composition texture
+    /// when the proxy swap chain presents the frame.
     pub(super) fn draw(
         &mut self,
         host: &Host,
@@ -867,6 +913,7 @@ impl Panel {
         back: &ID3D12Resource,
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
+        target: Target<'_>,
     ) -> Option<PanelCopy> {
         self.last_size = (width, height);
         if !shown().load(Ordering::Relaxed) || self.failed {
@@ -878,6 +925,18 @@ impl Panel {
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
+        let framegen = !matches!(target, Target::BackBuffer);
+        let separate = matches!(target, Target::SeparateUi);
+        let format = if framegen { UI_FORMAT } else { format };
+        if separate && self.ui.as_ref().is_none_or(|ui| ui.frames.size != (width, height)) {
+            // The presenter drains the proxy before replacing its back buffers.
+            self.ui = UiFrames::new(host, (width, height)).map(|frames| PanelUi { frames, current: None });
+            if self.ui.is_none() {
+                self.failed = true;
+                tracing::warn!("performance panel: could not allocate the frame generation UI texture");
+                return None;
+            }
+        }
         let replace = self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale));
         // SAFETY: a nonblocking query on the same queue fence used by Host::submit.
         let completed = if replace || self.changed { unsafe { host.fence.GetCompletedValue() } } else { 0 };
@@ -899,9 +958,24 @@ impl Panel {
             self.changed = true;
         }
         let buffers = self.buffers.as_mut()?;
-        let upload = if self.changed { buffers.write(snap, completed) } else { None };
+        let upload = if self.changed { buffers.write(snap, completed, framegen) } else { None };
         if upload.is_some() { self.changed = false; }
+        if upload.is_none() && !buffers.uploaded { return None; }
         let (w, h) = size(scale);
+        let own_ui = if let Some(ui) = self.ui.as_mut().filter(|_| separate) {
+            if let Some(index) = ui.current
+                && upload.is_none()
+            {
+                self.cost += began.elapsed();
+                return Some(PanelCopy { upload, ui: Some(ui.frames.images[index].clone()) });
+            }
+            let index = ui.current.map_or(0, |index| index ^ 1);
+            ui.current = Some(index);
+            Some(&ui.frames.images[index])
+        } else {
+            None
+        };
+        if let Some(ui) = own_ui { list.keep(ui); }
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
@@ -921,6 +995,20 @@ impl Panel {
                 )]);
                 buffers.uploaded = true;
             }
+            let target = match (own_ui, target) {
+                (Some(ui), _) => {
+                    let rtv = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    list.ResourceBarrier(&[transition(ui, UI_READ, rtv)]);
+                    list.ClearRenderTargetView(host.rtv(Some(ui), None), &[0.0; 4], None);
+                    list.ResourceBarrier(&[transition(ui, rtv, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    ui
+                }
+                (_, Target::GameUi(ui)) => {
+                    list.ResourceBarrier(&[transition(ui, UI_READ, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    ui
+                }
+                _ => back,
+            };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&buffers.card),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -938,7 +1026,7 @@ impl Panel {
                 },
             };
             let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(back),
+                pResource: std::mem::transmute_copy(target),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
             };
@@ -951,12 +1039,18 @@ impl Panel {
                 back: 1,
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
+            if framegen {
+                list.ResourceBarrier(&[transition(target, D3D12_RESOURCE_STATE_COPY_DEST, UI_READ)]);
+            }
         }
         self.cost += began.elapsed();
-        Some(PanelCopy { upload })
+        Some(PanelCopy {
+            upload,
+            ui: own_ui.cloned(),
+        })
     }
 
-    pub(super) fn submitted(&mut self, copied: Option<PanelCopy>, fence: u64) {
+    pub(super) fn submitted(&mut self, copied: Option<&PanelCopy>, fence: u64) {
         if let (Some(copied), Some(buffers)) = (copied, self.buffers.as_mut()) {
             buffers.card_fence = fence;
             if let Some(slot) = copied.upload {
@@ -994,8 +1088,9 @@ mod tests {
 
     #[test]
     fn a_box_is_painted() {
-        let snap = Snapshot {
+        let mut snap = Snapshot {
             fps: 32.0,
+            frame_rates: None,
             frame_ms: 31.2,
             gpu_ms: 28.7,
             gpu_pct: 92,
@@ -1025,7 +1120,23 @@ mod tests {
             sys_commit_gb: 48.0,
             history_ms: vec![28.0, 31.0, 85.0, 32.0],
         };
-        let canvas = paint_hud(&snap);
+        let canvas = paint_hud(&snap, false);
+        let header_has = |c: &Canvas, x: usize, color: [u8; 3]| {
+            (25..63).any(|y| c.rgb[y * c.w + x..y * c.w + x + 174].contains(&color))
+        };
+        assert_eq!((accent(0, 2), accent(1, 2), accent(2, 2)), (PINK, LILAC, BLUE));
+        assert!(header_has(&canvas, 14, PINK));
+        assert!(!canvas.rgb.contains(&FG_MINT));
+        assert!(!paint_hud(&snap, true).rgb.contains(&FG_MINT));
+        snap.frame_rates = Some((21.0, 42.0));
+        let generated = paint_hud(&snap, true);
+        assert!(header_has(&generated, 14, AMBER));
+        assert!(header_has(&generated, 198, FG_MINT));
+        assert_eq!(generated.rgb[17 * generated.w + 352], MUTED);
+        assert!(generated.rgb.iter().enumerate().all(|(i, &p)| {
+            p != FG_MINT || ((198..372).contains(&(i % generated.w)) && (33..68).contains(&(i / generated.w)))
+        }));
+        assert_eq!(paint_hud(&snap, false).rgb, canvas.rgb);
         for scale in [1u32, 2] {
             let (width, height) = size(scale);
             let pitch = (width * 4).next_multiple_of(256) as usize;
@@ -1033,7 +1144,11 @@ mod tests {
             assert_eq!(packed.len(), pitch * height as usize);
             let mut border = [0u8; 4];
             encode(DXGI_FORMAT_R10G10B10A2_UNORM, BORDER, &mut border);
-            assert_eq!(&packed[0..4], &border);
+            let top = (width / 2 * 4) as usize;
+            assert_eq!(&packed[top..top + 4], &border);
+            let mut corner = [0u8; 4];
+            encode(DXGI_FORMAT_R10G10B10A2_UNORM, BG, &mut corner);
+            assert_eq!(&packed[0..4], &corner);
         }
     }
 
