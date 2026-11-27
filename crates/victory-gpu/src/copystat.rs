@@ -1003,6 +1003,11 @@ fn log_memory() {
     // what host lists cost, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.
     let lists: Vec<u64> = crate::host::LISTS.iter().map(|l| l.load(Relaxed)).collect();
+    let (idle, fronts) = crate::list::idle_stats();
+    tracing::info!(
+        "memory, idle lists: {} host lists ({:.1} MB scratch), {} fronts; host hits/misses/releases {}/{}/{}; front hits/misses/releases {}/{}/{} (driver allocator bytes excluded)",
+        idle[0], mb(idle[1]), fronts[0], idle[2], idle[3], idle[4], fronts[2], fronts[3], fronts[4]
+    );
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \

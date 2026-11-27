@@ -18,6 +18,7 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static AVAILABLE_PHYSICAL: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 pub(crate) const UPLOAD_RETRY_MS: u64 = 500;
 
@@ -56,6 +57,7 @@ fn sample_commit(now: u64) -> u64 {
         && let Some(status) = memory_status()
     {
         AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+        AVAILABLE_PHYSICAL.store(status.ullAvailPhys, Ordering::Relaxed);
     }
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
@@ -74,6 +76,13 @@ fn has_growth_reserve(commit: u64, bytes: u64, bake: bool) -> bool {
     commit.saturating_sub(bytes) >= if bake { 256 * MIB } else { 1024 * MIB }
 }
 
+fn has_physical_reserve(physical: u64, bytes: u64, bake: bool) -> bool {
+    // Optional CPU-backed copies and speculative staging should not exhaust
+    // RAM just because a large pagefile still provides commit. Required
+    // uploads and decoration bakes retain their existing admission policy.
+    bake || physical.saturating_sub(bytes) >= GIB
+}
+
 /// Leave commit for game allocations and submissions already in flight while
 /// still letting bindless textures and one-shot material bakes upload.
 pub(crate) fn admit_texture_pass(bake: bool) -> bool {
@@ -88,7 +97,9 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
 /// (reusing existing free ranges in already-committed pool blocks stays open
 /// whenever `admit_texture_pass` is true).
 pub(crate) fn allow_staging_growth(bake: bool) -> bool {
-    allow_growth(0, bake)
+    // A newly committed staging pool block is 64 MiB. Count the allocation,
+    // not just the headroom before it, as optional standalone buffers do.
+    allow_growth(64 * MIB, bake)
 }
 
 /// Whether a second CPU-backed buffer can fit while leaving the existing
@@ -103,6 +114,7 @@ fn allow_growth(bytes: u64, bake: bool) -> bool {
         return false;
     }
     has_growth_reserve(sample_commit(now), bytes, bake)
+        && has_physical_reserve(AVAILABLE_PHYSICAL.load(Ordering::Relaxed), bytes, bake)
 }
 
 /// A PC with 32 GiB of RAM or less, or `VICTORY_RESIDENCY_LIMITED=1` (the
@@ -181,6 +193,17 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speculative_growth_leaves_physical_room_after_the_allocation() {
+        assert!(!has_physical_reserve(GIB, 64 * MIB, false));
+        assert!(has_physical_reserve(GIB + 64 * MIB, 64 * MIB, false));
+        assert!(!has_physical_reserve(512 * MIB, 0, false));
+        assert!(!has_physical_reserve(GIB, u64::MAX, false));
+        assert!(has_physical_reserve(128 * MIB, 64 * MIB, true));
+        // Required uploads can still use previously committed pool slices.
+        assert!(has_upload_reserve(512 * MIB, false));
+    }
 
     #[test]
     fn an_upload_deferral_reaches_the_enclosing_operation() {
