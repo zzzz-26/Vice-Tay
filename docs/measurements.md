@@ -1,5 +1,19 @@
 # Measurements
 
+To compare two runs at the same camera position, select the time spent in
+that scene from each diagnostics log. Supply times with an explicit offset.
+This PowerShell command selects one minute with more than 1,000 draws per frame.
+
+```powershell
+.\scripts\measure-frames.ps1 .\run.log -From '2026-11-27T12:00:00Z' -Until '2026-11-27T12:01:00Z' -MinDraws 1001
+```
+
+The start is included and the end is excluded. All three filters are optional.
+The script counts periodic rendered-frame reports and gives each one equal
+weight. P10 is the nearest-rank 10th percentile of their rendered FPS. A draw
+threshold can exclude menu samples. Keep the same scene and check the sample
+count in both runs.
+
 ## Series S frame generation
 
 On November 27, 2026, I measured a boat traversal on the RTX 4090 and Ryzen 9
