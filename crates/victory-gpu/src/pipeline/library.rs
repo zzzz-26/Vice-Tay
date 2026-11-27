@@ -532,6 +532,17 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Formats the trail entry when a pipeline was created after a library load
+/// did not return it. The library returns `E_INVALIDARG` if the name is absent
+/// or the stored description differs from the requested one.
+fn format_made_trail(label: &str, elapsed_ms: f64, refused: &windows::core::Error) -> String {
+    if refused.code() == windows::Win32::Foundation::E_INVALIDARG {
+        format!("pipeline library: made {label} in {elapsed_ms:.1} ms (no matching library entry)")
+    } else {
+        format!("pipeline library: made {label} in {elapsed_ms:.1} ms (the library did not load it: {refused})")
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -579,10 +590,7 @@ pub(crate) fn pipeline(
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
-        format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
-            began.elapsed().as_secs_f64() * 1e3
-        )
+        format_made_trail(&label, began.elapsed().as_secs_f64() * 1e3, &refused)
     });
     let mut storing = crate::timeline::span("pipeline: acquire library store guards");
     let _all = one_call();
@@ -1055,5 +1063,77 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn empty_library_compute_miss_returns_invalidarg_and_formats_cleanly() {
+        use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
+
+        let no_match = "pipeline library: made cs_probe in 1.5 ms (no matching library entry)";
+        let expected_miss = format_made_trail("cs_probe", 1.5, &windows::core::Error::from(E_INVALIDARG));
+        assert_eq!(expected_miss, no_match);
+        assert!(!expected_miss.contains("0x80070057"));
+        assert!(!expected_miss.contains("The parameter is incorrect"));
+
+        let unexpected = windows::core::Error::from(E_FAIL);
+        assert_eq!(
+            format_made_trail("cs_probe", 1.5, &unexpected),
+            format!("pipeline library: made cs_probe in 1.5 ms (the library did not load it: {unexpected})")
+        );
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device1>() else {
+            return;
+        };
+        let Some(library) = empty_test_library(&device) else {
+            return;
+        };
+
+        const CS: &str = "[RootSignature(\"\")] [numthreads(1, 1, 1)] void main() {}";
+        let code = crate::host::compile(CS, windows::core::s!("main"), windows::core::s!("cs_5_1"))
+            .expect("compile minimal compute shader");
+        // SAFETY: `code` holds a valid compiled shader with an embedded empty root signature.
+        let root: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, &code) }.expect("create empty root signature");
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed COM pointer; `root` outlives `desc`.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        };
+        let wide = HSTRING::from("issue187_compute_miss_probe");
+
+        // SAFETY: live library, null-terminated name, and valid compute pipeline description.
+        let miss = unsafe {
+            library.LoadComputePipeline::<_, ID3D12PipelineState>(PCWSTR(wide.as_ptr()), &desc)
+        }
+        .expect_err("empty pipeline library must miss on an unstored compute pipeline");
+        assert_eq!(miss.code(), E_INVALIDARG);
+
+        let miss_trail = format_made_trail("cs_probe", 1.5, &miss);
+        assert_eq!(miss_trail, no_match);
+        assert!(!miss_trail.contains("0x80070057"));
+        assert!(!miss_trail.contains("The parameter is incorrect"));
+
+        // SAFETY: valid description, live library, and live pipeline state.
+        unsafe {
+            let pso: ID3D12PipelineState =
+                host.device.CreateComputePipelineState(&desc).expect("create compute PSO");
+            library.StorePipeline(PCWSTR(wide.as_ptr()), &pso).expect("store compute PSO");
+            let reloaded: ID3D12PipelineState = library
+                .LoadComputePipeline(PCWSTR(wide.as_ptr()), &desc)
+                .expect("reload stored compute PSO");
+            drop(reloaded);
+            drop(pso);
+            assert!(
+                host.device.GetDeviceRemovedReason().is_ok(),
+                "device was removed during pipeline library miss/store/reload"
+            );
+        }
     }
 }

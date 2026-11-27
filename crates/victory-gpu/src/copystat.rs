@@ -1000,15 +1000,15 @@ fn log_memory() {
         own[7],
     );
     // Round 2: what the view table still holds and what goes around it,
-    // what host lists cost, the card's share that is the layer's own or
+    // host list counts and memory sampling, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.
     let lists: Vec<u64> = crate::host::LISTS.iter().map(|l| l.load(Relaxed)).collect();
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
          views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
-         made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
-         lists were made; twins of depth textures: {:.0} MB; host copies of \
+         made by the host, {} preludes made for them, summed process-private byte delta {:.0} MB \
+         across list-creation intervals (includes other threads); twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
          let go from memory so far: {:.0} MB; our own blocks of 32 MB and more, in MB: {}",

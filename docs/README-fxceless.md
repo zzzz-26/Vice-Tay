@@ -309,6 +309,9 @@ victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 victory config
 ```
 
+With `victory translate --validate --pipelines`, the validator must accept the
+DXIL before the tool asks D3D12 to create a pipeline.
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 

@@ -14,6 +14,7 @@ pub mod audio;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
+mod dsp_convolve;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]

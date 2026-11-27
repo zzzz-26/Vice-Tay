@@ -11,7 +11,7 @@
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance)
 # -Dlss4K       NVIDIA DLSS at 3840x2160 (quality, balanced or performance); FSR if it cannot start
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4090 or laptop
+# -Machine      auto (the default: by the graphics card), 7900xtx, 4070, 4070tisuper, 4090 or laptop
 #               (laptop: an NVIDIA PC with 16 GB of RAM and a 6-8 GB card, docs/laptop-16gb.md)
 # -More         other settings: -More @{VICTORY_PANEL='1'} or -More @{VICTORY_AMBIENT='1.0'}
 # On a smaller NVIDIA PC, compare the same Series S scene after a fresh start
@@ -32,14 +32,14 @@ param(
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Dlss4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('auto', '7900xtx', '4070', '4090', 'laptop')][string]$Machine = 'auto',
+    [ValidateSet('auto', '7900xtx', '4070', '4070tisuper', '4090', 'laptop')][string]$Machine = 'auto',
     [hashtable]$More = @{}
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_TITLE_PRIORITIES = '0'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'faults'
 }
 $ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory
 $controllers = @(if ($Machine -in 'auto', '7900xtx') {
@@ -47,7 +47,7 @@ $controllers = @(if ($Machine -in 'auto', '7900xtx') {
 })
 $hasNvidia = [bool]($controllers.PNPDeviceID -match 'VEN_10DE')
 if ($Machine -eq 'auto') {
-    # Use the existing vendor defaults. The 4070 / 7800X3D profile is explicit.
+    # Use the existing vendor defaults. The 4070 / 7800X3D and 4070 Ti SUPER profiles are explicit.
     $Machine = if ($hasNvidia) { '4090' } else { '7900xtx' }
 }
 if ($Machine -eq '7900xtx') {
@@ -94,6 +94,22 @@ if ($Machine -eq '4070') {
         $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
         $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
         $settings.VICTORY_CARD_WINDOWS_MB = '1024'
+    }
+}
+if ($Machine -eq '4070tisuper') {
+    # RTX 4070 Ti SUPER (16 GB, DXGI budget about 15.3 GB), Ryzen 7 9850X3D (eight cores), 32 GB.
+    # The 4070 profile's threads and card budgets: doubling them (3 GB of buffer copies, 4 GB of
+    # windows) took the card from 6.8 to 9.3 GB in the prison walk with the same frames (median
+    # 30, p10 27.5) and 2.5 GB more private memory, since a card copy keeps its CPU side in RAM.
+    # What the 16 GB card can take instead is the windows themselves, with no CPU side:
+    # up to 4 GB of them in card memory the CPU maps. That needs Resizable BAR (the GPU upload
+    # heap); without it the setting does nothing and windows stay as on the 4070 profile.
+    $settings.VICTORY_THIN_THREADS = '8'; $settings.VICTORY_UNDER_THREADS = '6'; $settings.VICTORY_LAND_THREADS = '4'
+    $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_PIPELINE_WORKERS = '3'
+    if (-not $Safe) {
+        $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
+        $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
+        $settings.VICTORY_CARD_WINDOWS_MB = '1024'; $settings.VICTORY_WINDOWS_BAR_MB = '4096'
     }
 }
 if ($Machine -eq 'laptop') {
@@ -175,8 +191,21 @@ $discarded = $inherited | Where-Object {
 if ($discarded) {
     Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
 }
+if ($hasNvidia -or $Machine -ne '7900xtx') {
+    $waveWideActive = $settings['VICTORY_WAVE_WIDE'] -eq '1' -and [string]::IsNullOrEmpty([string]$settings['VICTORY_WAVE_WIDE_ONLY'])
+    $inheritedWaveWide = $inherited | Where-Object { $_.Name -eq 'VICTORY_WAVE_WIDE' } | Select-Object -First 1
+    $inheritedWaveWideOnly = $inherited | Where-Object { $_.Name -eq 'VICTORY_WAVE_WIDE_ONLY' } | Select-Object -First 1
+    $waveWideInherited = -not $More.ContainsKey('VICTORY_WAVE_WIDE') -and
+        $inheritedWaveWide -and $inheritedWaveWide.Value -eq '1' -and
+        (-not $inheritedWaveWideOnly -or [string]::IsNullOrEmpty($inheritedWaveWideOnly.Value))
+    if ($waveWideActive) {
+        Write-Warning "VICTORY_WAVE_WIDE=1 without VICTORY_WAVE_WIDE_ONLY enables unrestricted wave-wide barriers across all wave64 compute shaders on NVIDIA, which can cause TDR (0x887A0006) hangs. Since PR #161, the 4 safe shaders are enabled by default; unset VICTORY_WAVE_WIDE or pass VICTORY_WAVE_WIDE_ONLY."
+    } elseif ($waveWideInherited) {
+        Write-Warning "Inherited VICTORY_WAVE_WIDE=1 without VICTORY_WAVE_WIDE_ONLY was discarded for this launch. Since PR #161, the 4 safe shaders are enabled by default; VICTORY_WAVE_WIDE=1 alone enables unrestricted wave-wide barriers across all wave64 compute shaders on NVIDIA (which can cause TDR 0x887A0006 hangs). Unset VICTORY_WAVE_WIDE or pass VICTORY_WAVE_WIDE_ONLY."
+    }
+}
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
-Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
+Push-Location -LiteralPath (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
     if (-not $SkipShaders) {
         $config = & $victory config

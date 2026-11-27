@@ -1,4 +1,4 @@
-//! PlayStation 5 pads (DualSense, DualSense Edge) read straight from HID:
+//! DualSense, DualSense Edge and USB DualShock 4 pads read straight from HID:
 //! they are not XInput devices, so without a remapper (Steam Input,
 //! DS4Windows) XInput never lists them. Reports can be USB or Bluetooth. A scan
 //! thread looks for new pads every [`SCAN`]; each pad has a reader thread
@@ -15,6 +15,15 @@ const SONY: u16 = 0x054C;
 /// DualSense, DualSense Edge.
 #[cfg(windows)]
 const PRODUCTS: [u16; 2] = [0x0CE6, 0x0DF2];
+#[cfg(windows)]
+const DUALSHOCK4_PRODUCTS: [u16; 2] = [0x05C4, 0x09CC];
+
+#[derive(Clone, Copy)]
+enum ReportKind {
+    DualSenseUsb,
+    DualSenseBluetooth,
+    DualShock4Usb,
+}
 
 /// The D-pad hat (low nibble of the first button byte): 0 up, clockwise in
 /// eighths, 8 and above centred.
@@ -49,16 +58,13 @@ const BUTTONS: [(usize, u8, u32); 11] = [
 ];
 
 /// The pad in one input report, `None` for a report of another kind.
-/// `bluetooth`: the pad is connected over Bluetooth, where the full report
-/// is 0x31 (one byte further in) and 0x01 is the short report the pad sends
-/// before it was asked for the full one.
-pub(super) fn parse(report: &[u8], bluetooth: bool) -> Option<PadState> {
+fn parse(report: &[u8], kind: ReportKind) -> Option<PadState> {
     // Offsets of the sticks (LX LY RX RY), the triggers (L2 R2) and the
     // three button bytes.
-    let (sticks, triggers, buttons) = match (report.first()?, bluetooth) {
-        (0x01, false) => (1, 5, 8),
-        (0x31, true) => (2, 6, 9),
-        (0x01, true) => (1, 8, 5),
+    let (sticks, triggers, buttons) = match (report.first()?, kind) {
+        (0x01, ReportKind::DualSenseUsb) => (1, 5, 8),
+        (0x31, ReportKind::DualSenseBluetooth) => (2, 6, 9),
+        (0x01, ReportKind::DualSenseBluetooth | ReportKind::DualShock4Usb) => (1, 8, 5),
         _ => return None,
     };
     if report.len() < sticks + 4 || report.len() < triggers + 2 || report.len() < buttons + 3 {
@@ -173,7 +179,7 @@ mod host {
     };
     use windows_sys::Win32::System::Threading::CreateEventW;
 
-    use super::{PRODUCTS, PadState, SONY, mac, parse};
+    use super::{DUALSHOCK4_PRODUCTS, PRODUCTS, PadState, ReportKind, SONY, mac, parse};
 
     /// How often to look for newly connected pads.
     const SCAN: Duration = Duration::from_secs(2);
@@ -234,7 +240,7 @@ mod host {
     }
 
     impl Reports {
-        fn for_device(handle: HANDLE) -> Option<Self> {
+        fn for_device(handle: HANDLE, kind: ReportKind) -> Option<Self> {
             let mut data = 0;
             // SAFETY: the device is open and the output is writable.
             if !unsafe { HidD_GetPreparsedData(handle, &mut data) } {
@@ -244,9 +250,17 @@ mod host {
             // SAFETY: `data` was obtained above and is released after its last use.
             let status = unsafe { HidP_GetCaps(data, &mut caps) };
             unsafe { HidD_FreePreparsedData(data) };
-            if status != HIDP_STATUS_SUCCESS
-                || caps.InputReportByteLength == 0
-                || caps.FeatureReportByteLength == 0
+            if status != HIDP_STATUS_SUCCESS {
+                return None;
+            }
+            Self::from_caps(&caps, kind)
+        }
+
+        fn from_caps(caps: &HIDP_CAPS, kind: ReportKind) -> Option<Self> {
+            let dualshock4 = matches!(kind, ReportKind::DualShock4Usb);
+            if caps.InputReportByteLength == 0
+                || dualshock4 && (caps.UsagePage != 1 || caps.Usage != 5)
+                || !dualshock4 && caps.FeatureReportByteLength == 0
             {
                 return None;
             }
@@ -255,6 +269,23 @@ mod host {
                 feature: vec![0; usize::from(caps.FeatureReportByteLength)],
             })
         }
+    }
+
+    #[test]
+    fn dualshock4_can_open_an_input_only_gamepad_collection() {
+        let mut caps = HIDP_CAPS {
+            UsagePage: 1,
+            Usage: 5,
+            InputReportByteLength: 64,
+            ..Default::default()
+        };
+        let reports = Reports::from_caps(&caps, ReportKind::DualShock4Usb).unwrap();
+        assert_eq!(reports.input.len(), 64);
+        assert!(reports.feature.is_empty());
+        assert!(Reports::from_caps(&caps, ReportKind::DualSenseUsb).is_none());
+
+        caps.Usage = 6;
+        assert!(Reports::from_caps(&caps, ReportKind::DualShock4Usb).is_none());
     }
 
     /// Feature report `id` into `buffer` (its first byte), `false` when the
@@ -304,19 +335,23 @@ mod host {
             {
                 continue;
             }
-            let Some((handle, mut reports)) = open(&path) else {
+            let bluetooth = lower.contains("{00001124-");
+            let Some((handle, mut reports, kind)) = open(&path, bluetooth) else {
                 continue;
             };
-            let bluetooth = lower.contains("{00001124-");
             // A paired pad that is switched off can still be listed over
             // Bluetooth: it does not answer.
-            if !full_reports(handle, &mut reports.feature) {
+            if !matches!(kind, ReportKind::DualShock4Usb)
+                && !full_reports(handle, &mut reports.feature)
+            {
                 tracing::debug!(path = %lower, "DualSense listed but not answering");
                 // SAFETY: just opened, nothing else has it.
                 unsafe { CloseHandle(handle) };
                 continue;
             }
-            let mac = if feature(handle, 0x09, &mut reports.feature) {
+            let mac = if !matches!(kind, ReportKind::DualShock4Usb)
+                && feature(handle, 0x09, &mut reports.feature)
+            {
                 mac(&reports.feature)
             } else {
                 None
@@ -348,22 +383,23 @@ mod host {
                 unsafe { CloseHandle(handle) };
                 continue;
             };
-            tracing::info!(path = %lower, bluetooth, "DualSense connected");
+            tracing::info!(path = %lower, bluetooth, "PlayStation gamepad connected");
             let raw = handle as usize;
             if let Err(error) = std::thread::Builder::new()
-                .name("DualSense reader".into())
-                .spawn(move || read(raw as HANDLE, id, bluetooth, reports))
+                .name("PlayStation gamepad reader".into())
+                .spawn(move || read(raw as HANDLE, id, kind, reports))
             {
                 lock().retain(|pad| pad.id != id);
                 // SAFETY: just opened, and no reader has it.
                 unsafe { CloseHandle(handle) };
-                tracing::warn!(%error, "could not start a DualSense reader");
+                tracing::warn!(%error, "could not start a PlayStation gamepad reader");
             }
         }
     }
 
     /// Reads reports until the pad goes away, then forgets it.
-    fn read(handle: HANDLE, id: u64, bluetooth: bool, mut reports: Reports) {
+    fn read(handle: HANDLE, id: u64, kind: ReportKind, mut reports: Reports) {
+        let bluetooth = matches!(kind, ReportKind::DualSenseBluetooth);
         let set = |state: Option<PadState>| {
             if let Some(pad) = lock().iter_mut().find(|pad| pad.id == id) {
                 pad.state = state;
@@ -411,7 +447,9 @@ mod host {
                 // Silent: whatever was held is not held any more, and the
                 // pad may be gone without the read failing.
                 set(None);
-                if !full_reports(handle, &mut reports.feature) {
+                if !matches!(kind, ReportKind::DualShock4Usb)
+                    && !full_reports(handle, &mut reports.feature)
+                {
                     // SAFETY: cancel the read and wait for it to end, so
                     // nothing writes into the input buffer once we return.
                     unsafe {
@@ -421,11 +459,11 @@ mod host {
                     break 'pad "not answering";
                 }
             }
-            if let Some(state) = parse(&reports.input[..got as usize], bluetooth) {
+            if let Some(state) = parse(&reports.input[..got as usize], kind) {
                 set(Some(state));
             }
         };
-        tracing::info!(why, bluetooth, "DualSense disconnected");
+        tracing::info!(why, bluetooth, "PlayStation gamepad disconnected");
         lock().retain(|pad| pad.id != id);
         // SAFETY: ours, and nothing uses them any more.
         unsafe {
@@ -438,7 +476,7 @@ mod host {
 
     /// The pad at `path` opened for reading, `None` when it is something else
     /// or cannot be opened.
-    fn open(path: &[u16]) -> Option<(HANDLE, Reports)> {
+    fn open(path: &[u16], bluetooth: bool) -> Option<(HANDLE, Reports, ReportKind)> {
         let mut name = path.to_vec();
         name.push(0);
         // SAFETY: a terminated path; no security attributes or template.
@@ -461,11 +499,22 @@ mod host {
             ..Default::default()
         };
         // SAFETY: an open device and room for its attributes.
-        let ours = unsafe { HidD_GetAttributes(handle, &mut attributes) }
-            && attributes.VendorID == SONY
-            && PRODUCTS.contains(&attributes.ProductID);
-        if ours && let Some(reports) = Reports::for_device(handle) {
-            return Some((handle, reports));
+        if unsafe { HidD_GetAttributes(handle, &mut attributes) } && attributes.VendorID == SONY {
+            let kind = match (attributes.ProductID, bluetooth) {
+                (product, false) if DUALSHOCK4_PRODUCTS.contains(&product) => {
+                    Some(ReportKind::DualShock4Usb)
+                }
+                (product, false) if PRODUCTS.contains(&product) => Some(ReportKind::DualSenseUsb),
+                (product, true) if PRODUCTS.contains(&product) => {
+                    Some(ReportKind::DualSenseBluetooth)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind
+                && let Some(reports) = Reports::for_device(handle, kind)
+            {
+                return Some((handle, reports, kind));
+            }
         }
         // SAFETY: just opened.
         unsafe { CloseHandle(handle) };
@@ -629,7 +678,7 @@ mod tests {
         report[5] = 255; // L2
         report[8] = 0x20 | 2; // cross, D-pad right
         report[9] = 0x20 | 0x01; // options, L1
-        let pad = parse(&report, false).unwrap();
+        let pad = parse(&report, ReportKind::DualSenseUsb).unwrap();
         assert_eq!(pad.buttons, A | RIGHT | MENU | LEFT_SHOULDER);
         assert_eq!(
             (pad.left_x, pad.left_y, pad.left_trigger),
@@ -645,14 +694,14 @@ mod tests {
         report[2..6].copy_from_slice(&[128, 0, 255, 128]); // left up, right right
         report[7] = 255; // R2
         report[9] = 0x80 | 8; // triangle, D-pad centred
-        let pad = parse(&report, true).unwrap();
+        let pad = parse(&report, ReportKind::DualSenseBluetooth).unwrap();
         assert_eq!(pad.buttons, Y);
         assert_eq!(
             (pad.left_y, pad.right_x, pad.right_trigger),
             (1.0, 1.0, 1.0)
         );
         // the same bytes over USB are not a pad report
-        assert_eq!(parse(&report, false), None);
+        assert_eq!(parse(&report, ReportKind::DualSenseUsb), None);
     }
 
     #[test]
@@ -663,8 +712,23 @@ mod tests {
         report[5] = 0x40 | 4; // circle, D-pad down
         report[7] = 0x02; // touchpad click
         report[8] = 128; // L2 halfway
-        let pad = parse(&report, true).unwrap();
+        let pad = parse(&report, ReportKind::DualSenseBluetooth).unwrap();
         assert_eq!(pad.buttons, B | DOWN | VIEW);
         assert!((pad.left_trigger - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn dualshock4_usb_reads_sticks_buttons_and_triggers() {
+        let mut report = [0u8; 64];
+        report[..10].copy_from_slice(&[1, 0, 255, 255, 0, 0x21, 0x20, 0x02, 255, 128]);
+        let pad = parse(&report, ReportKind::DualShock4Usb).unwrap();
+        assert_eq!(pad.buttons, A | UP | RIGHT | MENU | VIEW);
+        assert_eq!(
+            (pad.left_x, pad.left_y, pad.right_x, pad.right_y),
+            (-1.0, -1.0, 1.0, 1.0)
+        );
+        assert_eq!(pad.left_trigger, 1.0);
+        assert!((pad.right_trigger - 0.5).abs() < 0.01);
+        assert_eq!(parse(&report[..9], ReportKind::DualShock4Usb), None);
     }
 }

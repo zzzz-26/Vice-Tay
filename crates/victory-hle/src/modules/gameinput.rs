@@ -1118,6 +1118,11 @@ extern "system" fn mouse_state(this: *const Reading, out: *mut MouseState) -> bo
     };
     // SAFETY: the same output contract as above.
     unsafe { out.write(*state) };
+    #[cfg(feature = "diagnostics")]
+    {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| tracing::info!("the title read a GameInput mouse state"));
+    }
     true
 }
 /// Kinds our devices do not have: no count, no state.

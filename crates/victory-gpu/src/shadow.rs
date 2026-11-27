@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -1087,7 +1087,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize, (usize, u32, u32))) -> usize {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
@@ -1182,6 +1182,11 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     if ranges.len() < 2 {
+        return ranges;
+    }
+    // In order and apart already (what one stretch of them is): as they are,
+    // without the sort and the pass that joins.
+    if ranges.windows(2).all(|w| w[0].1 < w[1].0) {
         return ranges;
     }
     // (The sort that finds what is in order already: they come as a few
@@ -1343,6 +1348,12 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+        // In order and apart: as they are. In order and touching, or out of
+        // order: joined as before.
+        assert_eq!(joined(vec![(0, 10), (20, 30), (40, 50)]), [(0, 10), (20, 30), (40, 50)]);
+        assert_eq!(joined(vec![(0, 10), (10, 20), (30, 40)]), [(0, 20), (30, 40)]);
+        assert_eq!(joined(vec![(0, 10), (5, 8), (30, 40)]), [(0, 10), (30, 40)]);
+        assert_eq!(joined(vec![(20, 30), (0, 10), (5, 25)]), [(0, 30)]);
     }
 }
 
@@ -2252,6 +2263,7 @@ fn workers() -> &'static Workers {
         for i in 0..workers.thread_count {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                let mut priority = crate::cores::Priority::new();
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -2267,6 +2279,7 @@ fn workers() -> &'static Workers {
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
+                    priority.keep();
                     let _working = crate::timeline::span("a job for another thread");
                     job();
                 }
@@ -3716,7 +3729,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -3740,7 +3753,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.copied_count() as u64;
@@ -3915,7 +3928,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -6061,7 +6074,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -6313,7 +6326,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -6418,12 +6431,143 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+type LooseTable = BTreeMap<(u64, u64), Arc<Shadow>>;
+type PendingTickets = Mutex<BTreeMap<(u64, u64), Weak<Mutex<()>>>>;
+
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
+static LOOSE: std::sync::RwLock<LooseTable> = std::sync::RwLock::new(BTreeMap::new());
+
+/// Per-key constructor locks for pending loose-window allocations so
+/// concurrent misses on the same key do not allocate duplicate backing while
+/// unrelated lookups, allocations and sweeps proceed without waiting on `LOOSE`.
+static LOOSE_BUILDING: PendingTickets = Mutex::new(BTreeMap::new());
+
+fn pending_ticket(table: &PendingTickets, key: (u64, u64)) -> Arc<Mutex<()>> {
+    let mut map = table.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    if map.len() >= 64 {
+        map.retain(|_, weak| weak.strong_count() > 0);
+    }
+    let ticket = Arc::new(Mutex::new(()));
+    map.insert(key, Arc::downgrade(&ticket));
+    ticket
+}
+
+enum LooseBacking {
+    Mapped {
+        buffer: ID3D12Resource,
+        data: *mut u8,
+    },
+    Shared {
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        card: Option<ID3D12Resource>,
+    },
+}
+
+fn make_loose_backing(len: u64) -> Option<LooseBacking> {
+    // One buffer in the card's memory, filled by the CPU through the bus.
+    if let Some((buffer, data)) = window_mapped_for(len) {
+        return Some(LooseBacking::Mapped { buffer, data });
+    }
+    let (buffer, data) = host()?.shared_buffer(len)?;
+    // With room for windows on the card (`window_card_most`): shaders get a
+    // buffer there, and the one just made is the CPU's side.
+    let card = window_card_for(len);
+    Some(LooseBacking::Shared { buffer, data, card })
+}
+
+fn build_loose_shadow(start: u64, len: u64, backing: LooseBacking) -> Arc<Shadow> {
+    match backing {
+        LooseBacking::Mapped { buffer, data } => {
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+            shadow.window = true;
+            shadow.mapped = true;
+            Arc::new(shadow)
+        }
+        LooseBacking::Shared { buffer, data, card } => {
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            let (buffer, card) = match card {
+                Some(on_card) => {
+                    crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+                    let card = Card {
+                        staging: buffer,
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        has_dirty: AtomicBool::new(false),
+                        sent: Mutex::default(),
+                        has_sent: AtomicBool::new(false),
+                        size: len,
+                    };
+                    (on_card, Some(card))
+                }
+                None => (buffer, None),
+            };
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            tracing::debug!(
+                start = format_args!("{start:#x}"),
+                len,
+                "loose memory copied to the host"
+            );
+            let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+            shadow.window = true;
+            shadow.card = card;
+            Arc::new(shadow)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LooseQuery {
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    use_tails: bool,
+    use_holder: bool,
+    grid: u64,
+}
+
+fn loose_key_with(map: &LooseTable, cell: u64, named: (u64, u64), q: LooseQuery) -> (u64, u64) {
+    if q.use_tails {
+        let there = map.range((cell, 0)..=(q.address, u64::MAX)).map(|(key, _)| *key);
+        longest_tail(there, q.address, q.end).unwrap_or_else(|| tail_of(q.address, q.end))
+    } else if q.use_holder {
+        // The windows that begin in the ask's cell at or below the ask (one
+        // that begins in a cell below and reaches this far is passed over:
+        // the ask then makes its own).
+        let there = map.range((cell, 0)..=(q.address, u64::MAX)).map(|(key, _)| *key);
+        holder(there, q.address, q.end).unwrap_or(named)
+    } else {
+        named
+    }
+}
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    loose_with(
+        LooseQuery {
+            address,
+            end,
+            unsized_ask,
+            use_tails: unsized_ask && tails(),
+            use_holder: any && fine() && !unsized_ask,
+            grid: if unsized_ask { WINDOW } else { window() },
+        },
+        make_loose_backing,
+    )
+}
+
+fn loose_with(
+    q: LooseQuery,
+    make: impl Fn(u64) -> Option<LooseBacking>,
+) -> Option<Arc<Shadow>> {
+    let (cell, _) = window_of(q.address, q.end, WINDOW);
+    let named = window_of(q.address, q.end, q.grid);
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
@@ -6431,105 +6575,108 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         if shadow.used.load(Ordering::Relaxed) != now {
             shadow.used.store(now, Ordering::Relaxed);
         }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        if shadow.asked[0].load(Ordering::Relaxed) > q.address {
+            shadow.asked[0].fetch_min(q.address, Ordering::Relaxed);
         }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        if shadow.asked[1].load(Ordering::Relaxed) < q.end {
+            shadow.asked[1].fetch_max(q.end, Ordering::Relaxed);
         }
-        if unsized_ask {
+        if q.unsized_ask {
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
-    // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
-        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
-            note(shadow);
-            return Some(shadow.clone());
+    loop {
+        // The window is there already (nearly always): readers share the lock,
+        // including tail and fine-grid holder lookups.
+        let key = {
+            let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+            let key = loose_key_with(&map, cell, named, q);
+            if let Some(shadow) = map.get(&key) {
+                note(shadow);
+                return Some(shadow.clone());
+            }
+            key
+        };
+        // Keep the original transaction for optional imported/placed memory.
+        // The outside-lock path below only manufactures independent backing.
+        if crate::port::on() || crate::inplace::level() >= 1 {
+            let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+            let (start, len) = loose_key_with(&map, cell, named, q);
+            if let Some(shadow) = map.get(&(start, len)) {
+                note(shadow);
+                return Some(shadow.clone());
+            }
+            // In place, if asked for and the window's memory can be opened: the
+            // window is the title's own memory, with nothing to copy.
+            if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
+                let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+                note(&shadow);
+                map.insert((start, len), shadow.clone());
+                return Some(shadow);
+            }
+            let shadow = build_loose_shadow(start, len, make(len)?);
+            if shadow.card.is_some() {
+                CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            }
+            note(&shadow);
+            map.insert((start, len), shadow.clone());
+            return Some(shadow);
         }
-    }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
-    }
-    // In place, if asked for and the window's memory can be opened: the
-    // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
-    }
-    // One buffer in the card's memory, filled by the CPU through the bus.
-    if let Some((buffer, data)) = window_mapped_for(len) {
-        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
-        shadow.window = true;
-        shadow.mapped = true;
-        let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
-    }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                has_dirty: AtomicBool::new(false),
-                sent: Mutex::default(),
-                has_sent: AtomicBool::new(false),
-                size: len,
-            };
-            (on_card, Some(card))
+        // Serialize concurrent creators of the same key without holding the
+        // global LOOSE table lock across D3D12 creation, residency confirmation
+        // and CPU mapping.
+        let ticket = pending_ticket(&LOOSE_BUILDING, key);
+        let _only = ticket.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+            let selected = loose_key_with(&map, cell, named, q);
+            if let Some(shadow) = map.get(&selected) {
+                note(shadow);
+                return Some(shadow.clone());
+            }
+            if selected != key {
+                continue;
+            }
         }
-        None => (buffer, None),
-    };
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
-    shadow.window = true;
-    shadow.card = card;
-    let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        let candidate = build_loose_shadow(key.0, key.1, make(key.1)?);
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let selected = loose_key_with(&map, cell, named, q);
+        if let Some(existing) = map.get(&selected) {
+            // Another creator published this key or a wider holder/tail while
+            // we were allocating. Drop the unpublished candidate outside LOOSE.
+            note(existing);
+            let existing = existing.clone();
+            drop(map);
+            drop(_only);
+            drop(candidate);
+            return Some(existing);
+        }
+        if selected != key {
+            drop(map);
+            drop(_only);
+            drop(candidate);
+            continue;
+        }
+        if candidate.card.is_some() {
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&candidate));
+        }
+        note(&candidate);
+        map.insert(key, candidate.clone());
+        return Some(candidate);
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
 }
 
+type ExactTable = BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>;
+
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
-#[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+/// bytes), each with the asking that last took it.
+static EXACT: RwLock<ExactTable> = RwLock::new(BTreeMap::new());
+
+/// Askings for single buffer views' own copies so far.
+static EXACT_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Per-key constructor locks for pending single-view allocations.
+static EXACT_BUILDING: PendingTickets = Mutex::new(BTreeMap::new());
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -6551,41 +6698,103 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    exact_with(address, len, |size| host()?.shared_buffer(size))
+}
+
+fn exact_with(
+    address: u64,
+    len: u64,
+    make: impl Fn(u64) -> Option<(ID3D12Resource, *mut u8)>,
+) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
     const MANY: usize = 256;
     const LATELY: u64 = 512;
+    exact_with_limits(address, len, MANY, LATELY, make)
+}
+
+fn exact_with_limits(
+    address: u64,
+    len: u64,
+    many: usize,
+    lately: u64,
+    make: impl Fn(u64) -> Option<(ID3D12Resource, *mut u8)>,
+) -> Option<Arc<Shadow>> {
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    let key = (address, len);
+    let touch = |shadow: &Shadow, used: &AtomicU64, tick: u64| {
+        used.fetch_max(tick, Ordering::Relaxed);
+        let moment = crate::host::moment();
+        if shadow.used.load(Ordering::Relaxed) != moment {
+            shadow.used.store(moment, Ordering::Relaxed);
+        }
+    };
+    {
+        let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((shadow, used)) = map.get(&key) {
+            touch(shadow, used, now);
+            return Some(shadow.clone());
+        }
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+    let ticket = pending_ticket(&EXACT_BUILDING, key);
+    let _only = ticket.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((shadow, used)) = map.get(&key) {
+            touch(shadow, used, EXACT_TICK.load(Ordering::Relaxed).max(now));
+            return Some(shadow.clone());
+        }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data) = make(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
-    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-    OWN_MADE.fetch_add(1, Ordering::Relaxed);
-    Some(shadow)
+    let candidate = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut evicted = Vec::new();
+    let result = {
+        let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+        let published_now = EXACT_TICK.load(Ordering::Relaxed).max(now);
+        if let Some((existing, used)) = map.get(&key) {
+            touch(existing, used, published_now);
+            let existing = existing.clone();
+            drop(map);
+            drop(_only);
+            drop(candidate);
+            return Some(existing);
+        }
+        if map.len() >= many {
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), and not asked for lately.
+            let drop_keys: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, (shadow, used))| {
+                    Arc::strong_count(shadow) <= 1
+                        && crate::host::references(&shadow.buffer) <= 1
+                        && used.load(Ordering::Relaxed).saturating_add(lately) <= published_now
+                })
+                .map(|(&k, _)| k)
+                .collect();
+            for k in drop_keys {
+                if let Some((shadow, _)) = map.remove(&k) {
+                    evicted.push(shadow);
+                }
+            }
+        }
+        candidate.used.store(crate::host::moment(), Ordering::Relaxed);
+        map.insert(key, (candidate.clone(), AtomicU64::new(published_now)));
+        EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+        OWN_MADE.fetch_add(1, Ordering::Relaxed);
+        candidate
+    };
+    drop(_only);
+    drop(evicted);
+    Some(result)
 }
 
 /// Copies of single views' bytes made since the start.
@@ -6599,7 +6808,7 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
@@ -6607,6 +6816,9 @@ pub(crate) fn exact_line(frames: f64) {
         made as f64 / frames
     );
 }
+
+#[cfg(test)]
+mod loose_allocation_tests;
 
 #[cfg(test)]
 mod window_tests {

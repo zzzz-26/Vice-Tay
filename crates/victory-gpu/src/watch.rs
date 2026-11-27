@@ -1060,9 +1060,11 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// Tests that go through the submission's one asking ([`ask_once`]) hold
-/// this while they run: the asking is global, so two tests asking at once end
-/// each other's, and a write one of them waits for can be taken by the other.
+/// Tests that go through the submission's one asking ([`ask_once`]), or that
+/// guard views of their own, hold this while they run: the asking and the
+/// guards are global, so two tests asking at once end each other's, and a
+/// write one of them waits for can be taken by the other. A view one test maps
+/// beside another's guarded block makes that block be told as written again.
 #[cfg(test)]
 pub(crate) fn one_asking_test() -> std::sync::MutexGuard<'static, ()> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -4129,6 +4131,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _one = one_asking_test();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -4243,6 +4246,7 @@ mod tests {
     /// read itself leaves it open: the read lands, and is seen.
     #[test]
     fn a_refresh_leaves_open_what_the_kernel_is_writing() {
+        let _one = one_asking_test();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of two blocks, mapped read-write.
@@ -4363,6 +4367,7 @@ mod tests {
     /// taken for them: code stays code, private memory is not guarded.
     #[test]
     fn other_memory_at_a_guarded_address_keeps_its_protection() {
+        let _one = one_asking_test();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_EXECUTE_READ,
             PAGE_EXECUTE_READWRITE, UnmapViewOfFile2,
@@ -4426,6 +4431,7 @@ mod tests {
     /// its length or the allocation.
     #[test]
     fn freed_memory_leaves_no_notes() {
+        let _one = one_asking_test();
         let p = placeholder(3);
         let noted = |block: usize| {
             let g = guards();
@@ -4589,6 +4595,7 @@ mod tests {
     /// title code.
     #[test]
     fn a_block_guarded_before_we_were_told_of_its_view_can_be_written() {
+        let _one = one_asking_test();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -4631,6 +4638,7 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        let _one = one_asking_test();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -4692,6 +4700,7 @@ mod tests {
     /// or mapped since.
     #[test]
     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
+        let _one = one_asking_test();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -4783,6 +4792,7 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        let _one = one_asking_test();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -4916,6 +4926,7 @@ mod tests {
     /// guarded view's next check reports the pages written.
     #[test]
     fn a_write_through_another_view_is_reported_at_the_guarded_one() {
+        let _one = one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -4935,6 +4946,7 @@ mod tests {
     /// guarded view checks its pages again (and guards the new view).
     #[test]
     fn a_view_mapped_beside_a_guarded_one_makes_it_check_again() {
+        let _one = one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -4951,6 +4963,7 @@ mod tests {
     /// (`writing`): the other views' next checks report the pages written.
     #[test]
     fn a_write_told_at_one_view_is_reported_at_the_others() {
+        let _one = one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -4973,6 +4986,7 @@ mod tests {
     /// keep the bytes from before the write.
     #[test]
     fn a_write_is_reported_at_every_checked_view() {
+        let _one = one_asking_test();
         const SIZE: usize = 2 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
@@ -4997,6 +5011,7 @@ mod tests {
     /// read-only, are told as written, and take writes of their own.
     #[test]
     fn a_write_opens_the_view_it_goes_through() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         let page = |view: usize| view / PAGE;
         for view in [one, two] {
@@ -5028,6 +5043,7 @@ mod tests {
     /// as written at each asking, at every view of it, until it has rested.
     #[test]
     fn a_block_just_written_rests() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         let rests = |rests: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if rests { 3600 } else { 0 }));
@@ -5054,6 +5070,7 @@ mod tests {
     /// block stays read-only; until it has had its share.
     #[test]
     fn what_the_title_puts_in_beside_a_guard_is_told() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         crate::title_memory_section(section, BLOCK as u64, true);
         let page = |view: usize| view / PAGE;
@@ -5102,6 +5119,7 @@ mod tests {
     /// after, the block's guard and what the next asking says.
     #[test]
     fn stores_and_copies_of_the_title_leave_the_guard() {
+        let _one = one_asking_test();
         use std::sync::atomic::{AtomicU32, Ordering};
         unsafe extern "system-unwind" fn real(to: *mut u8, from: *const u8, n: usize) -> *mut u8 {
             // SAFETY: by the caller.
@@ -5277,6 +5295,7 @@ mod tests {
     /// is told as written at every asking, and the first is not guarded.
     #[test]
     fn what_the_kernel_writes_through_is_not_guarded_for_another_view() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
@@ -5317,6 +5336,7 @@ mod tests {
     /// count as written wherever else they are shown.
     #[test]
     fn a_view_being_split_leaves_its_pages_unguarded_elsewhere() {
+        let _one = one_asking_test();
         const SIZE: usize = 3 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages: Vec<usize> = (0..3).map(|k| one / PAGE + k).collect();
@@ -5344,6 +5364,7 @@ mod tests {
     /// itself: the others stay writable, and nothing looks through them all.
     #[test]
     fn a_page_of_many_views_is_guarded_one_view_at_a_time() {
+        let _one = one_asking_test();
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
@@ -5856,6 +5877,7 @@ mod many_askers_tests {
     /// or forgets it.
     #[test]
     fn bits_go_with_the_guard() {
+        let _one = crate::watch::one_asking_test();
         // SAFETY: a view of a section of our own, which stays.
         let at = unsafe {
             let section =
@@ -6183,6 +6205,7 @@ mod rearm_tests {
     /// not, and that is counted, as is a fault that gave no address.
     #[test]
     fn a_page_that_cannot_be_guarded_again_is_counted() {
+        let _one = one_asking_test();
         // SAFETY: a fresh page of our own.
         let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         assert_ne!(page, 0);

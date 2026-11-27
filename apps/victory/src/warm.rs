@@ -82,7 +82,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     run_batches(
         &all,
         jobs,
-        start_worker,
+        |indices| start_worker(indices, &entries),
         |n, ms, there| {
             if ms >= SLOW_MS {
                 writeln!(lock(&slow_out), "\n{} {ms:.0}", entries[n].key).context("writing slow-pipelines.txt")?;
@@ -171,11 +171,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn start_worker(these: &[usize]) -> Result<Child> {
+fn start_worker(these: &[usize], entries: &[known::WarmEntry]) -> Result<Child> {
     use std::os::windows::process::CommandExt;
     const IDLE_PRIORITY_CLASS: u32 = 0x40;
     let exe = std::env::current_exe().context("could not locate the warm worker executable")?;
-    let list: Vec<String> = these.iter().map(usize::to_string).collect();
+    let list: Vec<String> = these.iter().map(|&index| {
+        let recipe = &entries[index];
+        format!("{index}:{}:{}", recipe.offset, recipe.key)
+    }).collect();
     Command::new(&exe)
         .args(["warm", "--these", &list.join(",")])
         .stdin(Stdio::null())
@@ -318,7 +321,11 @@ fn child(
 
 /// What such a process does.
 fn make(dir: &Path, these: &str) -> Result<()> {
-    let these: Vec<usize> = these.split(',').map(|n| n.parse().context("--these")).collect::<Result<_>>()?;
+    let these = these.split(',').map(|request| {
+        let (index, details) = request.split_once(':').context("missing recipe offset in --these")?;
+        let (offset, key) = details.split_once(':').context("missing recipe key in --these")?;
+        Ok(known::WarmRecipe { index: index.parse()?, offset: offset.parse()?, key })
+    }).collect::<Result<Vec<_>>>()?;
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
     let mut out = std::io::stdout();
@@ -331,7 +338,7 @@ fn make(dir: &Path, these: &str) -> Result<()> {
             // Whoever asked is gone.
             std::process::exit(1);
         }
-    });
+    }).context("reading the selected pipeline recipes")?;
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)

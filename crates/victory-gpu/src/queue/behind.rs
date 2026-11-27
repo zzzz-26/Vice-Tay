@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 
 use super::This;
 use crate::fence::FenceRef;
+use crate::host::JoinStop;
 
 /// One thing in the line: what it stands at, if it does, and what it does.
 pub(super) trait Work: Send {
@@ -83,6 +84,7 @@ pub(super) trait Work: Send {
     {
         Err(next)
     }
+    fn join_stopped(&self, _reason: JoinStop) {}
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
     /// Renderer port #7 (`crate::port_journal`, from renderer patch #4): a mark taken when an entry is
@@ -391,6 +393,7 @@ impl<W: Work> Lane<W> {
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
+                entry.what.join_stopped(JoinStop::QueueBoundary);
                 break;
             };
             // (Back where it was: parts of one submission share a number.)
@@ -402,6 +405,7 @@ impl<W: Work> Lane<W> {
                     continue;
                 }
                 state.items.insert(at, next);
+                entry.what.join_stopped(JoinStop::FoldedWait);
                 break;
             }
             let Entry { number, queue, what, mark: theirs } = next;
@@ -552,16 +556,24 @@ impl Work for Job {
         matches!(self, Job::Run(..) | Job::Joined(..) | Job::Lists(..))
     }
 
+    fn join_stopped(&self, reason: JoinStop) {
+        note_join_stop(reason);
+    }
+
     fn take_along(&mut self, next: Job) -> Result<bool, Job> {
         let (most, most_lists) = crate::host::joins();
         if most < 2 {
+            note_join_stop(JoinStop::Disabled);
             return Err(next);
         }
         // Nothing but waits and signals that a submission may follow.
         let (count, lists, signals) = match self {
             Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
             Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
-            _ => return Err(next),
+            _ => {
+                note_join_stop(JoinStop::BoundaryJob);
+                return Err(next);
+            }
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
         match &next {
@@ -570,6 +582,7 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
+                    note_join_stop(JoinStop::ValueWait);
                     return Err(next);
                 }
             }
@@ -577,17 +590,29 @@ impl Work for Job {
                 if crate::fence::completed(fence.as_this()) < *value
                     && !signals.iter().any(|(f, v)| f == fence && v >= value)
                 {
+                    note_join_stop(JoinStop::FenceWait);
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                let stop = if count >= most {
+                    Some(JoinStop::PartLimit)
+                } else if lists.1.len() + runs.len() > most_lists {
+                    Some(JoinStop::ListLimit)
+                } else {
+                    crate::host::join_blocked(hosts(), &runs)
+                };
+                if let Some(reason) = stop {
+                    note_join_stop(reason);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => {
+                note_join_stop(JoinStop::BoundaryJob);
+                return Err(next);
+            }
         }
         // (A signal held in the line keeps its fence: no placeholder job
         // can stand in for this one while it is taken apart.)
@@ -707,6 +732,23 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+
+#[cfg(feature = "diagnostics")]
+const JOIN_STOP_COUNT: usize = JoinStop::EarlierWrite as usize + 1;
+#[cfg(feature = "diagnostics")]
+static JOIN_STOPS: [AtomicU64; JOIN_STOP_COUNT] = [const { AtomicU64::new(0) }; JOIN_STOP_COUNT];
+
+fn note_join_stop(reason: JoinStop) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_REASONS").is_some_and(|v| v == "1")) {
+            JOIN_STOPS[reason as usize].fetch_add(1, Relaxed);
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = reason;
+}
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -962,6 +1004,28 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let stops: [u64; JOIN_STOP_COUNT] = std::array::from_fn(|i| JOIN_STOPS[i].swap(0, Relaxed));
+        if stops.iter().any(|&count| count != 0) {
+            let per_frame = |reason: JoinStop| stops[reason as usize] as f64 / frames;
+            tracing::info!(
+                "submission join stops per frame (VICTORY_JOIN_REASONS): {:.1} no queued candidate, \
+                 {:.1} folded wait, {:.1} joining disabled, {:.1} other job, {:.1} value wait, \
+                 {:.1} fence wait, {:.1} part limit, {:.1} list limit, {:.1} CPU copy, {:.1} earlier write",
+                per_frame(JoinStop::QueueBoundary),
+                per_frame(JoinStop::FoldedWait),
+                per_frame(JoinStop::Disabled),
+                per_frame(JoinStop::BoundaryJob),
+                per_frame(JoinStop::ValueWait),
+                per_frame(JoinStop::FenceWait),
+                per_frame(JoinStop::PartLimit),
+                per_frame(JoinStop::ListLimit),
+                per_frame(JoinStop::CpuCopy),
+                per_frame(JoinStop::EarlierWrite),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

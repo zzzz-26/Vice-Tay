@@ -1102,7 +1102,9 @@ pub fn shut_down() {
         return;
     }
     let Some(host) = crate::host::made_host() else { return };
+    tracing::info!("frame generation: waiting for submitted work before shutdown");
     crate::external::finish_submitted();
+    tracing::info!("frame generation: releasing the presenter");
     host.release_framegen_presenter();
 }
 

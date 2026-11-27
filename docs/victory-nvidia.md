@@ -27,6 +27,10 @@ Windows Raw Input in the foreground and leaves the pointer, fullscreen and
 controller settings to the existing flows. An existing process-wide mouse
 registration takes priority.
 
+The diagnostics build reports the first relative mouse movement received by the
+title window and the first successful GameInput mouse state read. Move the
+mouse while the in-game camera is active and check for both messages.
+
 For a matched colour-grading comparison on NVIDIA, use the same build, scene,
 render settings and warmed driver cache in two runs. Set
 `-More @{VICTORY_LIBRARY_STATIC_SAMPLERS='1'}` in the control run to use the

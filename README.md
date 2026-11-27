@@ -73,6 +73,7 @@ Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command
 | --- | --- |
 | `-Console series-s` | Select the lighter console profile used in the sessions above. |
 | `-Machine 4090` / `-Machine 4070` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
+| `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. |
 | `-Machine laptop` | Try the [16 GB NVIDIA laptop preset](docs/laptop-16gb.md), measured on one RTX 3050 laptop. |
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |
@@ -166,6 +167,14 @@ bash linux/wineserver/build.sh
 ```
 
 Restart Steam and pick `GE-Proton11-14-viewtree`. GE-Proton's `master` already carries an equivalent change ([`em-fixups/0078-server-store-process-views-in-an-rb-tree.patch`](https://github.com/GloriousEggroll/proton-ge-custom/blob/master/patches/wine-hotfixes/em-fixups/0078-server-store-process-views-in-an-rb-tree.patch)); once a GE-Proton release includes it, this build is no longer needed. On one RTX 5080 (Series S profile, the same build and settings), the opening area ran at 2.7 to 4 fps with 190 to 294 ms of copies a frame on stock GE-Proton11-14, and at about 20 fps with 22 to 25 ms on the patched server.
+
+[`linux/play.sh`](linux/play.sh) starts a build cross-compiled with `cargo xwin build --target x86_64-pc-windows-msvc` on GE-Proton11-14's Wine, outside Steam, with the launcher's NVIDIA settings and no network. It uses `GE-Proton11-14-viewtree` when built. The Wine prefix needs Microsoft's `d3dcompiler_47.dll`, because Wine's own compiler rejects the HLSL Vice-Tay compiles at runtime; the script's header shows the `winetricks` line.
+
+```sh
+GAME=/path/to/title linux/play.sh series-s
+```
+
+DLSS also runs under Proton. Set `PROTON_ENABLE_NVAPI=1` and point `VICTORY_DLSS_DIR` at a folder that holds `nvngx_dlss.dll` (from [NVIDIA's DLSS SDK](https://github.com/NVIDIA/DLSS), `lib/Windows_x86_64/rel`). For example, add `PROTON_ENABLE_NVAPI=1 VICTORY_DLSS=quality VICTORY_DLSS_DIR="Z:/path/to/dlss"` to the launch options. On one RTX 5080 (Series S profile, GE-Proton11-14-viewtree, NVIDIA 620.73.04, DLSS 310.9.16), the log showed `NVIDIA DLSS serves the title's upscaler` and `DLSS: 1000 frames evaluated` at 1280 × 720 to 1920 × 1080; on that setup NGX found the driver's files through the environment at `/run/host/usr/lib/nvidia/wine` and turned its updater off under Wine. In two short runs on that machine in the opening area, the in-world median was 19.8 fps (7,233 draws a frame) with the title's own upscaler and 22.8 fps (7,019 draws a frame) with DLSS Quality, and the copies 27.5 and 18.5 ms a frame: DLSS replaces the title's own upscaler passes, along with the copies of their results.
 
 </details>
 

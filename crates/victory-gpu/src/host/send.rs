@@ -191,48 +191,70 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
+/// One copy's part of what a submission sends up, in one pass over its
+/// `ranges`: the runs copied get their places in the memory from `at` on and
+/// the pairs come behind them (`at` is moved past both), and the pieces of
+/// work that store the pairs (their ranges, where in the memory their pairs
+/// begin).
+fn laid_out<'a>(ranges: &'a [(usize, usize)], at: &mut u64) -> (Copy, Vec<(&'a [(usize, usize)], usize)>) {
+    let mut runs = Vec::new();
+    // (80,000 runs of some words a frame: in pieces of work. Each with the
+    // words of the pieces before it, until the pairs' place is known.)
+    let mut pieces = Vec::new();
+    let (mut words, mut before) = (0, 0);
+    for piece in ranges.chunks(RUNS_AT_A_TIME) {
+        for &(a, b) in piece {
+            // Runs of whole words of the copy: only those are pairs. (A byte
+            // beside them in a word may be the card's.)
+            if short(a, b - a) {
+                words += (b - a) / 4;
+            } else {
+                runs.push((a, *at, b - a));
+                *at += ((b - a) as u64).next_multiple_of(16);
+            }
+        }
+        if words > before {
+            pieces.push((piece, before));
+            before = words;
+        }
+    }
+    let pairs = *at;
+    for piece in &mut pieces {
+        piece.1 = pairs as usize + piece.1 * 8;
+    }
+    *at += (words as u64 * 8).next_multiple_of(16);
+    (Copy { runs, pairs: (pairs, words as u32) }, pieces)
+}
+
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
-    // Runs of whole words of the copy: only those are pairs. (A byte beside
-    // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
-        let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
-        }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
-        at += (words as u64 * 8).next_multiple_of(16);
+    // The pieces of work: the copy's CPU side, the ranges, and where their
+    // pairs begin in the memory (which is made once its size is known).
+    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    for (shadow, ranges) in dirty {
+        let (copy, pieces) = laid_out(ranges, &mut at);
+        let from = shadow.card_data() as usize;
+        work.extend(pieces.into_iter().map(|(ranges, to)| (from, ranges, to)));
+        copies.push(copy);
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
-    let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+    let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(copies.iter().map(|c| c.runs.len()).sum());
+    for ((shadow, _), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
-            }
-        }
     }
+    let base = memory.data;
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
+        let mut to = (base + to) as *mut [u32; 2];
+        for &(a, b) in ranges.iter().filter(|r| short(r.0, r.1 - r.0)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
@@ -335,5 +357,90 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RUNS_AT_A_TIME, laid_out, short};
+
+    /// The places of a copy's runs and pairs as three passes over its ranges
+    /// gave them: the runs, the pairs' place and number, the pieces of work
+    /// (first range, ranges, where their pairs begin), and the end.
+    #[allow(clippy::type_complexity)]
+    fn in_three_passes(
+        ranges: &[(usize, usize)],
+        mut at: u64,
+    ) -> (Vec<(usize, u64, usize)>, (u64, u32), Vec<(usize, usize, usize)>, u64) {
+        let short = |&(a, b): &(usize, usize)| short(a, b - a);
+        let mut runs = Vec::new();
+        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
+            runs.push((a, at, b - a));
+            at += ((b - a) as u64).next_multiple_of(16);
+        }
+        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        let pairs = (at, words as u32);
+        let mut pieces = Vec::new();
+        let mut to = at as usize;
+        for (index, piece) in ranges.chunks(RUNS_AT_A_TIME).enumerate() {
+            let words: usize = piece.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+            if words > 0 {
+                pieces.push((index * RUNS_AT_A_TIME, piece.len(), to));
+                to += words * 8;
+            }
+        }
+        (runs, pairs, pieces, at + (words as u64 * 8).next_multiple_of(16))
+    }
+
+    /// One pass lays a copy's runs and pairs out as the three did: copies of
+    /// no range, of one piece of work and of several, with pieces that hold
+    /// no pair, and one behind the other in the memory.
+    #[test]
+    fn one_pass_lays_out_what_three_did() {
+        let mut seed = 2026u32;
+        let mut random = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let mut at = 0u64;
+        let (mut pairs_seen, mut runs_seen, mut several) = (0, 0, 0);
+        for count in [0, 1, 7, RUNS_AT_A_TIME - 1, RUNS_AT_A_TIME, RUNS_AT_A_TIME + 1, 3 * RUNS_AT_A_TIME + 5] {
+            for long_piece in [false, true] {
+                let mut next = 0usize;
+                let ranges: Vec<(usize, usize)> = (0..count)
+                    .map(|i| {
+                        // A piece of work of long runs only, in one of the two.
+                        let long = long_piece && i / RUNS_AT_A_TIME == 1;
+                        let len = match random(8) {
+                            _ if long => 260 + random(900) as usize,
+                            0 => 257 + random(4000) as usize,
+                            1 => 1 + random(255) as usize,
+                            _ => 4 * (1 + random(64) as usize),
+                        };
+                        let from = next + random(3) as usize * if random(4) == 0 { 1 } else { 4 };
+                        next = from + len;
+                        (from, next)
+                    })
+                    .collect();
+                let (runs, pairs, pieces, end) = in_three_passes(&ranges, at);
+                let (copy, work) = laid_out(&ranges, &mut at);
+                assert_eq!(copy.runs, runs);
+                assert_eq!(copy.pairs, pairs);
+                let work: Vec<(usize, usize, usize)> = work
+                    .iter()
+                    .map(|&(piece, to)| {
+                        // SAFETY: `piece` is a sub-slice of `ranges`.
+                        let first = unsafe { piece.as_ptr().offset_from(ranges.as_ptr()) } as usize;
+                        (first, piece.len(), to)
+                    })
+                    .collect();
+                assert_eq!(work, pieces);
+                assert_eq!(at, end);
+                pairs_seen += pairs.1;
+                runs_seen += runs.len();
+                several += usize::from(pieces.len() > 1);
+            }
+        }
+        assert!(pairs_seen > 0 && runs_seen > 0 && several > 0);
     }
 }

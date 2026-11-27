@@ -150,7 +150,15 @@ pub(in crate::modules) fn receive(window: HWND, wparam: WPARAM, lparam: LPARAM) 
     // SAFETY: plain query of the foreground window. A packet can be queued before focus changes.
     if unsafe { GetForegroundWindow() } == window {
         // SAFETY: the packet header identifies the initialized union member as a mouse.
-        accumulate(&mut capture.state, unsafe { packet.data.mouse });
+        let mouse = unsafe { packet.data.mouse };
+        accumulate(&mut capture.state, mouse);
+        #[cfg(feature = "diagnostics")]
+        if mouse.usFlags & MOUSE_MOVE_ABSOLUTE == 0 && (mouse.lLastX != 0 || mouse.lLastY != 0) {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                tracing::info!("received relative mouse movement in the title window")
+            });
+        }
     }
 }
 

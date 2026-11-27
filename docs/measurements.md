@@ -12,7 +12,18 @@ The start is included and the end is excluded. All three filters are optional.
 The script counts periodic rendered-frame reports and gives each one equal
 weight. P10 is the nearest-rank 10th percentile of their rendered FPS. A draw
 threshold can exclude menu samples. Keep the same scene and check the sample
-count in both runs.
+count in both runs. The script reads console reports copied with line breaks
+between fields, including in the header.
+
+Pass `-TextureProgress` to report the indexed-texture counters from each
+matching frame report. Compare the UTC time, draws per frame, uploaded
+textures and MiB, waiting textures and slots passed over as unmapped.
+Use the same time and draw filters to compare a selected load interval.
+
+In the diagnostics memory report, the private-byte delta near the host-list
+counts sums process-wide changes sampled during list creation. Concurrent
+calls can overlap, and other threads can allocate or free memory in the same
+intervals. Measure allocator cost in a separate run.
 
 ## Series S frame generation
 
@@ -57,3 +68,14 @@ and is left out of conclusions (README, Known problems).
 | Series S | 94 | 23.5 / 24.1 | 27.4 | 8.8 | 86.0 | 134.5 | 49.6 | 2760.0 | 624 |
 
 CPU seconds per minute: the game's CPU time over all its threads; 60 is one core busy all the time.
+
+## RTX 5070 session observation
+
+t90 recorded a session lasting 1 hour, 47 minutes and 54 seconds from launch
+through manual close on an RTX 5070 (12 GB). The diagnostics build combined
+`2dd3479`, `755dc92` and `e11801e` locally and used a 1,152 MiB card-buffer cap.
+
+The log contains 6,322 renderer submission reports, with a maximum gap of
+3.457 seconds between reports. The elapsed time includes startup and loading
+and may include menu or idle time. It describes this session's continuity.
+[Contributor report](https://github.com/TaynanGT/Vice-Tay/pull/240)

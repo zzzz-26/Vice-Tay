@@ -53,6 +53,19 @@ How each of these was found, with the numbers:
   default. Making one holds a global lock; on a card whose view heap has no raw
   twins (NVIDIA) every such view took it, and the list threads queued on it down
   to 6 fps (`VICTORY_STRUCTURED_RAW=1` makes the copies).
+- **Reuse lazy state preludes** with `VICTORY_PRELUDE_POOL=1`. The pool
+  takes the allocator and command list back after the owning list resets,
+  once its prior submission has finished. It holds up to 128 idle pairs.
+  To try it on the reported RX 6900 XT setup, add
+  `-More @{VICTORY_PRELUDE_POOL='1'}` to the same Series S launch. The pool-on
+  run loaded the world, and the creation count stayed at 155 for 67 seconds
+  under memory pressure.
+  A separate Windows Sandbox test on an RTX 5090 D v2 made 831 preludes with
+  the pool off and 186 with it on. These are endpoint counts for allocator
+  reuse. Keep the save, relay settings, resolution and cache the same when
+  comparing stability or frame times.
+  [RX 6900 XT report](https://github.com/TaynanGT/Vice-Tay/issues/93#issuecomment-7217111392) ·
+  [RTX 5090 D v2 report](https://github.com/TaynanGT/Vice-Tay/pull/211#issuecomment-7218626007)
 
 ## Picture
 
@@ -98,7 +111,17 @@ How each of these was found, with the numbers:
 - **Scripted keys** (`VICTORY_KEYS_FILE`): the file is taken by renaming it before
   it is read, so a batch written meanwhile is never deleted unread.
 
+- **DSP convolution.** Add `-More @{VICTORY_DSP_CONVOLUTION='1'}` to test the
+  host convolution path for phone calls and other filtered audio. Compare
+  the same call with the option off and on, at the same volume.
+  [Upstream test](https://github.com/Marvisak/VIctory/pull/3332)
+
 ## Measuring
+
+With a diagnostics build, add `-More @{VICTORY_JOIN_REASONS='1'}` to log why
+the submission lane stopped joining work. The per-frame line separates a
+queue boundary, a wait, the configured limits, and submission dependencies.
+Compare it alongside the number of joined submissions in the same interval.
 
 - Every host list that ran is kept for reuse.
 - Frame dumps (`VICTORY_CAPTURE`) are encoded on a thread of their own, and the
