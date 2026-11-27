@@ -774,10 +774,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     // Two sides all the same, the card's in the PC's memory.
     let host = host()?;
-    if !cards() || !host.card_ready() || !crate::residency::allow_optional_buffer_growth(size) {
+    if !cards() || !host.card_ready() {
         return None;
     }
+    let reservation = crate::residency::reserve_growth(size, false)?;
     let (buffer, _) = host.shared_buffer(size)?;
+    reservation.complete();
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
     Some(buffer)
 }
@@ -889,10 +891,12 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     }
     // Two sides all the same, the card's in the PC's memory.
     let host = host()?;
-    if !host.card_ready() || !crate::residency::allow_optional_buffer_growth(size) {
+    if !host.card_ready() {
         return None;
     }
+    let reservation = crate::residency::reserve_growth(size, false)?;
     let (buffer, _) = host.shared_buffer(size)?;
+    reservation.complete();
     WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
     Some(buffer)
 }

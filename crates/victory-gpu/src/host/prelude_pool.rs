@@ -8,9 +8,9 @@ struct IdlePrelude(Prelude);
 // SAFETY: D3D12 objects are free-threaded. No list owns an idle prelude.
 unsafe impl Send for IdlePrelude {}
 
-pub(super) struct Pool(Mutex<Vec<IdlePrelude>>);
+pub(super) struct Pool(Mutex<crate::idle_pool::Pool<IdlePrelude>>);
 
-pub(super) static IDLE: Pool = Pool(Mutex::new(Vec::new()));
+pub(super) static IDLE: Pool = Pool(Mutex::new(crate::idle_pool::Pool::new()));
 
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -19,7 +19,7 @@ fn enabled() -> bool {
 
 impl Pool {
     fn take(&self) -> Option<Prelude> {
-        let idle = self.0.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let idle = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(IdlePrelude(prelude)) = idle {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| tracing::info!("reused a state prelude (VICTORY_PRELUDE_POOL)"));
@@ -30,13 +30,21 @@ impl Pool {
     }
 
     fn give(&self, prelude: Prelude) {
-        // Retaining the bounded set avoids recreating command memory on
-        // every batch while host RAM pressure persists.
-        let mut idle = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.len() < IDLE_LIMIT {
-            idle.push(IdlePrelude(prelude));
-        }
+        let rejected = self.0.lock().unwrap_or_else(|e| e.into_inner())
+            .put(IdlePrelude(prelude), 0, super::coarse_ms(), IDLE_LIMIT, u64::MAX);
+        drop(rejected);
     }
+}
+
+pub(super) fn trim_idle() {
+    if !crate::idle_pool::trimming() { return; }
+    let gone = IDLE.0.try_lock().ok().map(|mut idle| idle.trim(super::coarse_ms(), crate::residency::pressured(), 16));
+    drop(gone);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(super) fn idle_stats() -> [u64; 5] {
+    IDLE.0.lock().unwrap_or_else(|e| e.into_inner()).stats()
 }
 
 pub(super) enum Slot {
@@ -94,7 +102,7 @@ mod tests {
         if host().is_none() {
             return;
         }
-        let pool = Pool(Mutex::new(Vec::new()));
+        let pool = Pool(Mutex::new(crate::idle_pool::Pool::new()));
         let first = Slot::Pooled(Mutex::new(None));
         let second = Slot::Pooled(Mutex::new(None));
         let allocator = |(allocator, _): &Prelude| allocator.as_raw() as usize;

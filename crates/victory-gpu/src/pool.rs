@@ -394,10 +394,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
-        if speculative && !crate::residency::allow_staging_growth(false) {
-            return None;
-        }
+        let reservation = if speculative { Some(crate::residency::reserve_growth(BLOCK, false)?) } else { None };
         let (buffer, data) = host.upload_buffer(BLOCK)?;
+        if let Some(reservation) = reservation { reservation.complete(); }
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;

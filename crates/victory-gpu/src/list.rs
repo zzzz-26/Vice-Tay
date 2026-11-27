@@ -225,7 +225,7 @@ pub(crate) fn ran(lists: &mut [Detached]) {
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -240,7 +240,7 @@ unsafe impl Send for Idle {}
 /// four in ten a budget and an argument buffer (run 61: "104 host lists
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+static IDLE: std::sync::Mutex<crate::idle_pool::Pool<Idle>> = std::sync::Mutex::new(crate::idle_pool::Pool::new());
 
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
@@ -263,16 +263,9 @@ fn pools() -> bool {
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
-            idle.1 -= bytes;
-        }
-        taken
-    };
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -290,19 +283,30 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).full(IDLE_MOST.0) {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
-        }
+        let rejected = IDLE.lock().unwrap_or_else(|e| e.into_inner())
+            .put(Idle(host), bytes, crate::host::coarse_ms(), IDLE_MOST.0, IDLE_MOST.1);
+        drop(rejected);
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    if !crate::idle_pool::trimming() { return; }
+    let gone = IDLE.try_lock().ok().map(|mut idle| idle.trim(crate::host::coarse_ms(), crate::residency::pressured(), 32));
+    drop(gone);
+    thin::trim_idle();
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn idle_stats() -> [[u64; 5]; 2] {
+    [IDLE.lock().unwrap_or_else(|e| e.into_inner()).stats(), thin::idle_stats()]
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut

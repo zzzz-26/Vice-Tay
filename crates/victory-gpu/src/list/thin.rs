@@ -165,7 +165,7 @@ static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
-static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static BACKS: Mutex<crate::idle_pool::Pool<usize>> = Mutex::new(crate::idle_pool::Pool::new());
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -277,7 +277,9 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let limit = if crate::idle_pool::trimming() { 512 } else { usize::MAX };
+            let rejected = held(&BACKS).put(inner.back, 0, crate::host::coarse_ms(), limit, u64::MAX);
+            if let Some(back) = rejected { super::list_release(back as This); }
         }
     }
 }
@@ -294,7 +296,7 @@ fn give_back(streams: Vec<Vec<u64>>) {
 
 /// A list of ours, closed.
 fn back_list(kind: u32) -> This {
-    if let Some(back) = held(&BACKS).pop() {
+    if let Some(back) = held(&BACKS).take() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
@@ -302,6 +304,18 @@ fn back_list(kind: u32) -> This {
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
     list
+}
+
+pub(super) fn trim_idle() {
+    let gone = BACKS.try_lock().ok().map(|mut backs| backs.trim(crate::host::coarse_ms(), crate::residency::pressured(), 32));
+    if let Some(gone) = gone {
+        for back in gone { super::list_release(back as This); }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(super) fn idle_stats() -> [u64; 5] {
+    held(&BACKS).stats()
 }
 
 fn start() {

@@ -98,6 +98,9 @@ if ($Machine -eq '4070') {
         $settings.VICTORY_CARD_RESERVE_BUDGETS = '1'
         $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'; $settings.VICTORY_CARD_BUFFERS_MB = '1536'
         $settings.VICTORY_CARD_WINDOWS_MB = '1024'
+        # Allocate backing only for streamed texture levels; dropped levels
+        # retire their tiles after GPU completion. Requires tiled tier >= 2.
+        $settings.VICTORY_LEVELS_ON_DEMAND = '1'
     }
 }
 if ($Machine -eq '4070tisuper') {

@@ -563,6 +563,9 @@ fn sweep() {
     let memory = host.and_then(|h| h.video_memory());
     if let Some(host) = host { host.trim_title_stock(memory); }
     crate::pool::room(memory);
+    crate::list::trim_idle();
+    send::trim_idle();
+    prelude_pool::trim_idle();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -573,6 +576,11 @@ fn sweep() {
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn idle_stats() -> [[u64; 5]; 2] {
+    [send::idle_stats(), prelude_pool::idle_stats()]
 }
 
 /// Drops `object` once every submission running now has finished: at once

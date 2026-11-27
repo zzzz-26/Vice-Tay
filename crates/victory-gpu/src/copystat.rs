@@ -999,6 +999,12 @@ fn log_memory() {
         mb(own[3]),
         own[7],
     );
+    let lists_idle = crate::list::idle_stats();
+    let host_idle = crate::host::idle_stats();
+    tracing::info!(
+        lists = ?lists_idle[0], thin = ?lists_idle[1], uploads = ?host_idle[0], preludes = ?host_idle[1],
+        "memory, idle pools: [count, bytes, hits, misses, released]; list bytes count scratch only, not driver allocator storage"
+    );
     // Round 2: what the view table still holds and what goes around it,
     // host list counts and memory sampling, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.

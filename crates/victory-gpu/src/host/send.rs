@@ -116,7 +116,7 @@ pub(super) struct Memory {
 unsafe impl Send for Memory {}
 
 /// What submissions that have run gave back.
-static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
+static SPARE: Mutex<crate::idle_pool::Pool<Memory>> = Mutex::new(crate::idle_pool::Pool::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
@@ -137,10 +137,9 @@ fn on_card() -> bool {
 
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
-        if let Some(i) = fit {
-            return Some(spare.swap_remove(i));
+        let found = SPARE.lock().unwrap_or_else(|e| e.into_inner()).best_fit(size);
+        if found.is_some() {
+            return found;
         }
     }
     // By doubles, so that the next of about this size finds it: what
@@ -161,12 +160,24 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
 
 /// The submission has run.
 pub(super) fn give_back(memory: Memory) {
-    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    spare.push(memory);
-    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
-    }
+    let (rejected, gone) = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = memory.size;
+        let rejected = spare.put(memory, bytes, coarse_ms(), usize::MAX, u64::MAX);
+        (rejected, spare.cap_bytes(kept()))
+    };
+    drop((rejected, gone));
+}
+
+pub(super) fn trim_idle() {
+    if !crate::idle_pool::trimming() { return; }
+    let gone = SPARE.try_lock().ok().map(|mut spare| spare.trim(coarse_ms(), crate::residency::pressured(), 2));
+    drop(gone);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(super) fn idle_stats() -> [u64; 5] {
+    SPARE.lock().unwrap_or_else(|e| e.into_inner()).stats()
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,

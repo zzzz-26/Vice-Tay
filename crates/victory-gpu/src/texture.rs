@@ -2063,13 +2063,19 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
-            if crate::residency::upload_refused()
-                || (speculative && !crate::residency::allow_staging_growth(false))
-            {
+            if crate::residency::upload_refused() {
                 crate::residency::note_upload_deferred();
                 return None;
             }
+            let reservation = if speculative {
+                let Some(reservation) = crate::residency::reserve_growth(total, false) else {
+                    crate::residency::note_upload_deferred();
+                    return None;
+                };
+                Some(reservation)
+            } else { None };
             let (buffer, data) = host.upload_buffer(total)?;
+            if let Some(reservation) = reservation { reservation.complete(); }
             crate::host::name(&buffer, || {
                 format!(
                     "staging of {resource:?} {}x{}x{} f{}",
