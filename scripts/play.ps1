@@ -147,6 +147,9 @@ if ($Machine -eq 'laptop') {
 # -Safe leaves out every way still on trial, and the newest faster ones.
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    $settings.VICTORY_SPARSE_SNAPSHOTS = '0'; $settings.VICTORY_POOL_PACK = '0'
+    $settings.VICTORY_TIGHT_HASH_BUFFERS = '0'; $settings.VICTORY_BATCH_RESIDENCY = '0'
+    $settings.VICTORY_SECTION_CHUNK_MB = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
     # A dispatch does not end a batch of argument clamps before the title waits

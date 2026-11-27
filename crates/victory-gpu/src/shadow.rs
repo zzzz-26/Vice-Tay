@@ -425,7 +425,7 @@ pub(crate) struct Shadow {
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    before: Mutex<Option<crate::snapshot::Snapshot>>,
     /// Held shared while pieces of the copy are landed (`crate::land`), each
     /// its own bytes of it on several threads, and alone while title bytes
     /// go in under shader writes ([`Shadow::merge_under_writes`]), which
@@ -4168,7 +4168,10 @@ impl Shadow {
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot = before.get_or_insert_with(|| pooled(total));
+        let snapshot = before.get_or_insert_with(|| crate::snapshot::Snapshot::new(total, || pooled(total)));
+        // Commit only newly declared pages, before publishing pointers to
+        // deferred snapshot workers. Existing preimages stay untouched.
+        for &(from, to) in &parts { snapshot.prepare(from, to); }
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a
@@ -4477,7 +4480,9 @@ impl Shadow {
             // the snapshot's.)
             kept.0.clear();
         }
-        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && let Some(bytes) = snapshot.recycle()
+        {
             give_back(bytes);
         }
     }
@@ -5285,6 +5290,7 @@ impl Shadow {
             // refresh writes; the lock keeps the landing out.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            snapshot.prepare(from, to);
             // SAFETY: the snapshot's allocation holds the copy's length.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
         }
@@ -5708,7 +5714,7 @@ impl Shadow {
         crate::land::spent(crate::land::stat::LOCK, waiting);
         // The snapshot's memory stays where it is until the range is done
         // with (`copy_back_done`), which comes after this.
-        let Some(held) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(Vec::as_mut_ptr) else {
+        let Some(held) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(crate::snapshot::Snapshot::as_mut_ptr) else {
             return 0;
         };
         // SAFETY: inside the copy's mapping (checked above), which only the

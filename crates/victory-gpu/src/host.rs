@@ -63,6 +63,7 @@ pub(crate) struct Host {
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
     fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
     texture_readbacks: ReadbackPool<ID3D12Resource>,
+    tight_hash_buffers: OnceLock<bool>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -273,6 +274,10 @@ unsafe impl Send for Aside {}
 /// that: run n11 was lost as n08 was with it alone.) Best done off a hot
 /// path: a tenth of a millisecond to some.
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
+    residency_batch::mapped(device)
+}
+
+fn mapped_one(device: &ID3D12Device) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     if !wait_resident() {
         return Ok(());
@@ -354,7 +359,7 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     let started = std::time::Instant::now();
     let object: ID3D12Pageable = object.cast()?;
     // SAFETY: a live heap or resource of the device's.
-    let made = unsafe { device.MakeResident(&[Some(object)]) };
+    let made = residency_batch::resident(device, object);
     let us = started.elapsed().as_micros() as u64;
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
@@ -568,6 +573,7 @@ fn sweep() {
     prelude_pool::trim_idle();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
+    crate::snapshot::trim();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }
@@ -1119,6 +1125,7 @@ fn create() -> windows::core::Result<Host> {
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
             texture_readbacks: ReadbackPool::new(),
+            tight_hash_buffers: OnceLock::new(),
         })
     }
 }
@@ -4467,6 +4474,8 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod mapping_fence;
+pub(crate) mod residency_batch;
+mod tight_alignment;
 mod prelude_pool;
 mod title_stock;
 mod card_steps;
@@ -5132,7 +5141,7 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                let before = self.hash_buffer(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -11128,6 +11137,16 @@ impl Host {
     /// (with `written`) may write. The CPU should only write it: a read of the
     /// mapping crosses the bus a few bytes at a time.
     pub(crate) fn mapped_card_buffer(&self, size: u64, written: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_card_buffer_access(size, written, true)
+    }
+
+    /// Explicitly write-only CPU mapping for submission uploads. Other users
+    /// can have comparison/readback paths and retain their full read range.
+    fn mapped_card_upload(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_card_buffer_access(size, false, false)
+    }
+
+    fn mapped_card_buffer_access(&self, size: u64, written: bool, cpu_reads: bool) -> Option<(ID3D12Resource, *mut u8)> {
         if !self.mapped_card_memory() {
             return None;
         }
@@ -11172,7 +11191,8 @@ impl Host {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     resident(&self.device, b)?;
                     mapped(&self.device)?;
-                    b.Map(0, None, Some(&mut data))
+                    let no_reads = D3D12_RANGE { Begin: 0, End: 0 };
+                    b.Map(0, if cpu_reads { None } else { Some(&no_reads) }, Some(&mut data))
                 })
         };
         match made {
@@ -11187,6 +11207,14 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_impl(size, false)
+    }
+
+    fn hash_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_impl(size, true)
+    }
+
+    fn uav_buffer_impl(&self, size: u64, internal_hash: bool) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -11208,16 +11236,24 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a device-local buffer.
+        let tight = (internal_hash && size < 65536 && *self.tight_hash_buffers.get_or_init(|| tight_alignment::supported(&self.device)))
+            .then(|| tight_alignment::description(&self.device, &desc)).flatten();
+        // SAFETY: plain creation of a device-local buffer. Tight alignment is
+        // feature-gated, and only internal hashes opt in; retry unchanged if
+        // the driver refuses that description.
         let made = unsafe {
-            self.device.CreateCommittedResource(
+            let result = self.device.CreateCommittedResource(
                 &heap,
                 not_resident(),
-                &desc,
+                tight.as_ref().unwrap_or(&desc),
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
                 &mut buffer,
-            )
+            );
+            if result.is_err() && tight.is_some() {
+                buffer = None;
+                self.device.CreateCommittedResource(&heap, not_resident(), &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+            } else { result }
         };
         #[cfg(feature = "diagnostics")]
         if let Some(b) = &buffer {

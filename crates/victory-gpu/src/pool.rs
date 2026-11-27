@@ -88,6 +88,11 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
 }
 
+fn pack_occupied() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_PACK").is_none_or(|v| v != "0"))
+}
+
 /// How many blocks of textures are made ahead, so that one has been there
 /// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12;
 /// 0: none, and new blocks are used at once, as before).
@@ -233,14 +238,21 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        // Preserve whole empty blocks for large requests or reclamation.
+        // A freed early slot must not divert small pieces away from a later
+        // occupied block. No live allocation moves and ripeness still wins.
+        for empty in [false, true] {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && (!pack_occupied() || block.free.whole(BLOCK) == empty)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
+            if found.is_some() { break; }
         }
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
@@ -342,6 +354,20 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn occupancy(&self) -> [u64; 8] {
+        let blocks = self.blocks() as u64;
+        let resting = self.resting.iter().map(|(_, p)| p.len).sum::<u64>();
+        let (mut free, mut empty, mut partial_free, mut largest) = (0, 0, 0, 0);
+        for block in self.blocks.iter().flatten() {
+            let bytes = block.free.0.values().sum::<u64>();
+            free += bytes;
+            if block.free.whole(BLOCK) { empty += BLOCK; } else { partial_free += bytes; }
+            largest = largest.max(block.free.0.values().copied().max().unwrap_or(0));
+        }
+        [blocks, blocks * BLOCK, blocks * BLOCK - free - resting, resting, free, empty, partial_free, largest]
+    }
 }
 
 /// A mapped upload buffer's memory.
@@ -352,6 +378,11 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn occupancy() -> [[u64; 8]; 2] {
+    [lock(&TEXTURES).occupancy(), lock(&STAGING).occupancy()]
+}
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -737,6 +768,26 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occupied_blocks_are_packed_before_empty_ones_without_moving_live_pieces() {
+        let mut pool = Pool::new(2);
+        pool.add(10u32, 0);
+        pool.add(20, 0);
+        pool.blocks[1].as_mut().unwrap().free.take(4096, 4096).unwrap();
+        let (piece, memory, _) = pool.take(4096, 4096, 0, || panic!("already has space")).unwrap();
+        assert_eq!((piece.block, piece.start, memory), (1, 4096, 20));
+        assert!(pool.blocks[0].as_ref().unwrap().free.whole(BLOCK));
+        pool.give(piece, 0);
+        let stats = pool.occupancy();
+        assert_eq!(stats[2], 4096);
+        assert_eq!(stats[3], 4096);
+        assert_eq!(stats[2] + stats[3] + stats[4], stats[1]);
+        assert_eq!(stats[5], BLOCK);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        assert_eq!(pool.occupancy()[2], 4096);
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {

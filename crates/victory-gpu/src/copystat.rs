@@ -1000,6 +1000,17 @@ fn log_memory() {
         own[7],
     );
     let lists_idle = crate::list::idle_stats();
+    let pools = crate::pool::occupancy();
+    tracing::info!(batches = ?crate::host::residency_batch::stats(),
+        "memory, residency batches: [requests, driver operations, largest batch, failed requests]; opt-in");
+    tracing::info!(queue = ?crate::host::aside::stats(),
+        "memory, descriptor worker: [queued, peak queued, active, queue wait us, max queue wait us, service us, completed]; timings cumulative");
+    tracing::info!(textures = ?pools[0], staging = ?pools[1],
+        "memory, pool occupancy: [blocks, backing bytes, live, resting, reusable, empty-block bytes, free-in-partial-blocks, largest gap]; byte categories overlap as described, not driver residency");
+    tracing::info!(
+        snapshots = ?crate::snapshot::stats(),
+        "memory, active snapshots: [count, capacity/address reservation, dense capacity + sparse commit, declared range union, sparse cache count, sparse cache commit]; bytes, not working set"
+    );
     let host_idle = crate::host::idle_stats();
     tracing::info!(
         lists = ?lists_idle[0], thin = ?lists_idle[1], uploads = ?host_idle[0], preludes = ?host_idle[1],

@@ -398,14 +398,28 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 // Physical pages: on the console, 64 KiB frames a title maps into its own
 // reservations, at more than one address if it likes. Here each allocation
-// is a pagefile-backed section, its pages are 64 KiB slices of it, and a
+// is backed by one or more sections, its pages are 64 KiB slices, and a
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+// Section capacities, not committed bytes or unique resident physical pages.
+static SECTION_BYTES: AtomicU64 = AtomicU64::new(0);
+static OWNED_PAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Large physical allocations may use independently reclaimable sections.
+/// Opt-in until streaming/capture comparisons establish a useful chunk size.
+/// Keep smaller heaps and Wine's imported committed sections unchanged.
+fn section_chunk_pages(n: usize) -> usize {
+    static MB: LazyLock<usize> = LazyLock::new(|| std::env::var("VICTORY_SECTION_CHUNK_MB").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0));
+    if *MB == 0 || n.saturating_mul(PAGE) < 1024 * MIB || on_wine() { return n; }
+    MB.saturating_mul(MIB).div_ceil(PAGE).max(1).min(n)
+}
 
 struct Section {
     handle: HANDLE,
     pages: usize,
+    owned: AtomicUsize,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
     window: std::sync::OnceLock<usize>,
@@ -496,6 +510,8 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        SECTION_BYTES.fetch_sub((self.pages * PAGE) as u64, Ordering::Relaxed);
+        OWNED_PAGE_BYTES.fetch_sub((self.owned.load(Ordering::Relaxed) * PAGE) as u64, Ordering::Relaxed);
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         if let Some(&base) = self.window.get()
             && base != 0
@@ -661,9 +677,26 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).is_none_or(|s| s == 0) {
+        return 0;
+    }
+    let Some(numbers) = allocate_physical_pages(n, section_chunk_pages(n)) else {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
         return 0;
     };
+    tracing::debug!(n, flags = format_args!("{flags:#x}"), "XMemAllocatePhysicalPages");
+    // No runtime locks while touching title memory: a fault may wait for a
+    // mapping call which takes those locks.
+    for (index, number) in numbers.into_iter().enumerate() {
+        // SAFETY: the title passes room for n page numbers.
+        unsafe { pages.add(index).write(number) };
+    }
+    1
+}
+
+fn make_section(n: usize) -> Option<Arc<Section>> {
+    let size = n.checked_mul(PAGE).filter(|&s| s > 0)?;
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -685,42 +718,58 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+        return None;
     }
-    tracing::debug!(
-        n,
-        flags = format_args!("{flags:#x}"),
-        "XMemAllocatePhysicalPages"
-    );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section {
+    SECTION_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    OWNED_PAGE_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    Some(Arc::new(Section {
         handle,
         pages: n,
+        owned: AtomicUsize::new(n),
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
+    }))
+}
+
+fn allocate_physical_pages(n: usize, chunk: usize) -> Option<Vec<usize>> {
+    allocate_physical_pages_with(n, chunk, make_section)
+}
+
+fn allocate_physical_pages_with(n: usize, chunk: usize, mut make: impl FnMut(usize) -> Option<Arc<Section>>) -> Option<Vec<usize>> {
+    if n == 0 || chunk == 0 { return None; }
+    let span = n.checked_mul(FRAMES)?;
+    n.checked_mul(PAGE)?;
+    // Prepare every section before publishing page IDs. On failure, Arc
+    // destruction closes all sections already made; no partial allocation.
+    let mut sections = Vec::new();
+    let mut left = n;
+    while left > 0 {
+        let count = left.min(chunk);
+        sections.push(make(count)?);
+        left -= count;
+    }
     let mut table = page_table_mut();
     let first = table.next_page;
-    table.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        table.pages.insert(first + index * FRAMES, slice);
+    let Some(next) = first.checked_add(span) else {
+        drop(table);
+        return None;
+    };
+    table.next_page = next;
+    let mut number = first;
+    for section in &sections {
+        for index in 0..section.pages {
+            table.pages.insert(number, Slice { section: section.clone(), index });
+            number += FRAMES;
+        }
     }
-    // Title memory is touched without our locks: a fault there may wait for
-    // a mapping call, which takes them.
     drop(table);
-    for index in 0..n {
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(first + index * FRAMES) };
+    if sections.len() > 1 {
+        tracing::debug!(sections = sections.len(), pages = n, chunk_pages = chunk, "physical allocation uses reclaimable sections");
     }
-    1
+    Some((0..n).map(|index| first + index * FRAMES).collect())
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -738,8 +787,15 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut table = page_table_mut();
     // Dropped without the lock: the last page of a section unmaps its window.
     let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
+    for slice in &gone {
+        slice.section.owned.fetch_sub(1, Ordering::Relaxed);
+        OWNED_PAGE_BYTES.fetch_sub(PAGE as u64, Ordering::Relaxed);
+    }
     drop(table);
     drop(gone);
+    tracing::debug!(section_capacity = SECTION_BYTES.load(Ordering::Relaxed),
+        owned_page_bytes = OWNED_PAGE_BYTES.load(Ordering::Relaxed),
+        "physical pages freed: section capacity may remain while other pages or views hold it; not committed RAM");
     1
 }
 
@@ -2033,6 +2089,66 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_physical_failure_releases_prepared_sections() {
+        let mut made = Vec::new();
+        let result = allocate_physical_pages_with(6, 2, |n| {
+            if made.len() == 2 { return None; }
+            let section = make_section(n)?;
+            made.push(Arc::downgrade(&section));
+            Some(section)
+        });
+        assert!(result.is_none());
+        assert_eq!(made.len(), 2);
+        assert!(made.iter().all(|section| section.upgrade().is_none()));
+    }
+
+    #[test]
+    fn chunked_physical_aliases_survive_free_until_unmapped() {
+        let pages = allocate_physical_pages(4, 2).unwrap();
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 4, pages.as_ptr()), b);
+        let data = vec![0x39; PAGE + 7];
+        assert!(write_physical(&pages, PAGE + 5, &data));
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        // SAFETY: both views still own all four pages, including the section
+        // boundary; freeing page IDs does not unmap their existing aliases.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(a.cast::<u8>().add(PAGE + 5), data.len()), data);
+            b.cast::<u8>().add(2 * PAGE).write(0x7a);
+            assert_eq!(a.cast::<u8>().add(2 * PAGE).read(), 0x7a);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 4, std::ptr::null()), b);
+        assert_ne!(title_virtual_free(a, 0, MEM_RELEASE), 0);
+        assert_ne!(title_virtual_free(b, 0, MEM_RELEASE), 0);
+    }
+
+    #[test]
+    fn chunked_physical_pages_cross_sections_and_release_only_after_last_user() {
+        let pages = allocate_physical_pages(4, 2).unwrap();
+        let first = {
+            let table = page_table();
+            Arc::downgrade(&table.pages[&pages[0]].section)
+        };
+        let data = vec![0x6d; PAGE + 32];
+        assert!(write_physical(&pages, PAGE - 16, &data));
+        assert!(page_window(&pages, PAGE - 16, data.len()).is_none());
+        assert!(page_window(&pages[..2], PAGE - 16, PAGE + 16).unwrap().bytes().iter().all(|&b| b == 0x6d));
+        assert_eq!(page_window(&pages[2..], 0, 16).unwrap().bytes(), &[0x6d; 16]);
+        let mut held = page_window(&pages[..2], PAGE, 8).unwrap();
+        assert_ne!(XMemFreePhysicalPages(2, pages.as_ptr()), 0);
+        assert!(first.upgrade().is_some(), "DirectStorage window still owns the section");
+        assert_eq!(held.bytes(), &[0x6d; 8]);
+        drop(held);
+        assert!(first.upgrade().is_none(), "other sections must not keep this one alive");
+        assert!(pages_known(&pages[2..], 0, 2 * PAGE));
+        assert_ne!(XMemFreePhysicalPages(2, pages[2..].as_ptr()), 0);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

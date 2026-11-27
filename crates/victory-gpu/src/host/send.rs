@@ -145,7 +145,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     // By doubles, so that the next of about this size finds it: what
     // submissions send differs from frame to frame.
     let size = size.max(8 << 20).next_power_of_two();
-    let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
+    let mapped = if on_card() { host.mapped_card_upload(size) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
         None => host.upload_buffer(size)?,
