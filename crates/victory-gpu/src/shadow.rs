@@ -1738,6 +1738,15 @@ impl SnapshotPool {
         self.bytes += capacity;
     }
 
+    /// Return-time and sweep-time pressure policy agree: a busy producer
+    /// must not refill the normal 512 MiB cache between pressure sweeps.
+    fn return_buffer(&mut self, v: Vec<u8>, count: usize, pressured: bool) -> Vec<Vec<u8>> {
+        self.put(v);
+        let mut gone = if pressured { self.keep_smallest(POOL_PRESSURED_KEPT) } else { Vec::new() };
+        gone.extend(self.keep_largest(count, 512 << 20));
+        gone
+    }
+
     /// Normal returns keep the largest buffers, including one oversized buffer.
     fn keep_largest(&mut self, count: usize, most: usize) -> Vec<Vec<u8>> {
         if self.buffers.len() <= count && self.bytes <= most {
@@ -1815,16 +1824,15 @@ fn snapshots_kept() -> usize {
 }
 
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
+/// the largest up to 512 MiB normally, the smallest up to 32 MiB under
+/// pressure. An oversized buffer is retained only without pressure.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
     let count = snapshots_kept();
+    let pressured = crate::residency::pressured();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
-    pool.put(v);
     // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.keep_largest(count, KEPT);
+    let gone = pool.return_buffer(v, count, pressured);
     drop(pool);
     drop(gone);
 }
@@ -1844,7 +1852,7 @@ const POOL_PRESSURED_KEPT: usize = 32 << 20;
 ///   and four frames, all of it goes;
 /// - while the host is short of memory, all but [`POOL_PRESSURED_KEPT`]
 ///   goes, the largest first, whatever the size of the largest. Returns can
-///   refill the pool between sweeps.
+///   refill only that smaller budget between sweeps.
 ///
 /// The next snapshot is then memory fresh from the kernel, as it was for
 /// every snapshot past the pool before. Called by the once-a-second sweep.
@@ -1915,6 +1923,21 @@ mod pool_tests {
         assert_eq!(pool.bytes, 8 << 20);
         assert_eq!(sizes(&pool.keep_largest(0, 7 << 20)), [8 << 20]);
         assert!(pool.buffers.is_empty());
+        assert_eq!(pool.bytes, 0);
+    }
+
+    #[test]
+    fn sustained_returns_cannot_refill_a_pressured_pool() {
+        let mut pool = pool_with_sizes(&[8, 4, 2, 1]);
+        for _ in 0..8 {
+            drop(pool.return_buffer(Vec::with_capacity(40 << 20), 1024, true));
+            assert_eq!(pool.bytes, 15 << 20);
+            assert!(pool.take(40 << 20).is_none());
+        }
+        assert_eq!(pool.take(3 << 20).unwrap().capacity(), 4 << 20);
+        drop(pool.return_buffer(Vec::with_capacity(40 << 20), 1024, false));
+        assert!(pool.take(40 << 20).is_some());
+        drop(pool.return_buffer(Vec::with_capacity(1 << 20), 0, true));
         assert_eq!(pool.bytes, 0);
     }
 
@@ -3794,18 +3817,20 @@ fn loose_bytes<'a>(copies: impl Iterator<Item = &'a Arc<Shadow>>) -> u64 {
 /// identity, due)`, sorted oldest first. A `due` copy has been idle for as
 /// long as the sweep asks without a budget and goes whatever the budget: a
 /// budget never keeps more than none. The others go, oldest first, while
-/// `total` (the unique bytes of every loose copy, [`loose_bytes`]) is over
-/// `keep`. A copy standing under several keys goes under all of them and
-/// counts once.
+/// `total` (all unique live bytes, including pinned copies) is over `keep`.
+/// A copy standing under several keys goes under all of them and counts once.
 fn window_victims(entries: &[(u64, usize, bool)], total: u64, keep: u64) -> Vec<usize> {
     let mut left = total;
-    let mut gone = std::collections::HashSet::new();
-    for &(bytes, id, due) in entries {
-        if due && gone.insert(id) {
+    let mut seen: std::collections::HashSet<_> = entries.iter().map(|&(_, id, _)| id).collect();
+    let mut out = Vec::new();
+    for (i, &(bytes, id, due)) in entries.iter().enumerate() {
+        if due && seen.remove(&id) {
             left = left.saturating_sub(bytes);
+            out.push(i);
         }
     }
-    for &(bytes, id, _) in entries {
+    for (i, &(bytes, id, _)) in entries.iter().enumerate() {
+
         if left <= keep {
             break;
         }
@@ -3869,10 +3894,18 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
+        // All table-owned references count as one copy. External references
+        // still pin it, even when several keys alias the same window.
+        let mut owners = std::collections::HashMap::<usize, (usize, u64)>::new();
+        for s in map.values() {
+            let entry = owners.entry(Arc::as_ptr(s) as usize).or_insert((0, copy_bytes(s)));
+            entry.0 += 1;
+        }
+        let total = owners.values().fold(0u64, |bytes, &(_, len)| bytes.saturating_add(len));
         let mut eligible: Vec<(u64, (u64, u64), usize, u64, bool)> = map
             .iter()
             .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
+                Arc::strong_count(s) == owners[&(Arc::as_ptr(s) as usize)].0
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
@@ -3890,9 +3923,25 @@ pub(crate) fn let_go_idle() {
                 .iter()
                 .map(|&(_, _, id, bytes, due)| (bytes, id, due))
                 .collect();
-            window_victims(&entries, loose_bytes(map.values()), keep)
+                .iter()
+                .map(|&(_, _, id, bytes, due)| (bytes, id, due))
+                .collect();
+            window_victims(&entries, total, keep)
         };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+        let victims: std::collections::HashSet<_> = victims.into_iter().map(|i| eligible[i].2).collect();
+        let mut removed = std::collections::HashSet::new();
+        let mut gone = Vec::new();
+        map.retain(|_, s| {
+            let id = Arc::as_ptr(s) as usize;
+            if !victims.contains(&id) {
+                return true;
+            }
+            if removed.insert(id) {
+                gone.push(s.clone());
+            }
+            false
+        });
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -6656,9 +6705,8 @@ mod window_tests {
         const M: u64 = 1 << 20;
         // The first two entries are one copy; 50 MiB is live, not 80.
         // Without dedupe both copies would be picked to reach a 40 MiB cap.
-        // The copy goes under both its keys: under one alone it would stay.
         let entries = [(30 * M, 7usize, false), (30 * M, 7, false), (20 * M, 8, false)];
-        assert_eq!(window_victims(&entries, 50 * M, 40 * M), vec![0, 1]);
+        assert_eq!(window_victims(&entries, 50 * M, 40 * M), vec![0]);
     }
 
     /// #450 (the issue's row): copies held by a list or a slot, or used
@@ -6679,8 +6727,8 @@ mod window_tests {
         assert!(window_victims(&idle, total, 8_192 * M).is_empty());
     }
 
-    /// #450: a budget never keeps more copies than none. Those idle for the
-    /// time the sweep asks without one go even when everything fits.
+    /// A budget never keeps more copies than none. Those idle for the time
+    /// the sweep asks without one go even when everything fits.
     #[test]
     fn window_budget_never_keeps_what_the_sweep_lets_go_without_one() {
         const M: u64 = 1 << 20;
@@ -6697,6 +6745,17 @@ mod window_tests {
         const M: u64 = 1 << 20;
         let entries = [(0, 1usize, false), (64 * M, 2, false), (0, 3, true)];
         assert_eq!(window_victims(&entries, 64 * M, 0), vec![1, 2]);
+    }
+
+    #[test]
+    fn pinned_windows_consume_the_budget_without_becoming_victims() {
+        const M: u64 = 1 << 20;
+        let entries = [(256 * M, 1usize, false), (256 * M, 2, false)];
+        // 3 GiB pinned plus 512 MiB eligible: both eligible copies must go.
+        assert_eq!(window_victims(&entries, 3_584 * M, 1_024 * M), vec![0, 1]);
+        // 768 MiB pinned: evict only enough eligible bytes to reach 1 GiB.
+        assert_eq!(window_victims(&entries, 1_280 * M, 1_024 * M), vec![0]);
+        assert!(window_victims(&[], 3_072 * M, 0).is_empty());
     }
 
     #[test]
