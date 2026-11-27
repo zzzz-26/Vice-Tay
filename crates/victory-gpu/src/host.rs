@@ -556,7 +556,6 @@ fn sweep() {
     let memory = host.and_then(|h| h.video_memory());
     if let Some(host) = host { host.trim_title_stock(memory); }
     crate::pool::room(memory);
-    crate::list::trim_idle();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();

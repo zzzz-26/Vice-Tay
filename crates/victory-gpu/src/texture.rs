@@ -441,61 +441,22 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// One scratch buffer per reading thread, weakly registered so the sweep
-/// can release a loading-screen peak even after that worker becomes idle.
-struct ReadScratch {
-    bytes: Vec<u8>,
-    large_use: std::time::Instant,
-}
-
-impl ReadScratch {
-    fn take_idle(&mut self, now: std::time::Instant, pressure: bool) -> Option<Vec<u8>> {
-        (self.bytes.capacity() > 1 << 20
-            && crate::residency::cache_expired(now.saturating_duration_since(self.large_use), pressure))
-            .then(|| std::mem::take(&mut self.bytes))
-    }
-}
-
-static READ_BUFFERS: Mutex<Vec<std::sync::Weak<Mutex<ReadScratch>>>> = Mutex::new(Vec::new());
-
 thread_local! {
-    static READ: Arc<Mutex<ReadScratch>> = {
-        let read = Arc::new(Mutex::new(ReadScratch {
-            bytes: Vec::new(), large_use: std::time::Instant::now(),
-        }));
-        READ_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&read));
-        read
-    };
-}
-
-fn trim_read_buffers() {
-    let reads: Vec<_> = {
-        let mut registry = READ_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
-        registry.retain(|read| read.strong_count() != 0);
-        registry.iter().filter_map(std::sync::Weak::upgrade).collect()
-    };
-    let now = std::time::Instant::now();
-    let pressure = crate::residency::pressured();
-    for read in reads {
-        // A worker may be detiling. Never block it or invalidate its slice.
-        let gone = read.try_lock().ok().and_then(|mut read| read.take_idle(now, pressure));
-        drop(gone);
-    }
+    /// Room to read a texture's memory into: one buffer per submitting
+    /// thread. Each texture kept its own, a second copy in memory of every
+    /// write-watched or partly mapped texture ever sampled, for the run.
+    static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
-        let mut read = read.lock().unwrap_or_else(|e| e.into_inner());
-        if read.bytes.len() < size {
-            read.bytes.resize(size, 0);
+        let mut read = read.borrow_mut();
+        if read.len() < size {
+            read.resize(size, 0);
         }
-        // Small reads must not keep a once-large buffer warm forever.
-        if size >= read.bytes.capacity() / 4 {
-            read.large_use = std::time::Instant::now();
-        }
-        f(&mut read.bytes[..size])
+        f(&mut read[..size])
     })
 }
 
@@ -570,7 +531,6 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    trim_read_buffers();
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -2154,20 +2114,6 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
-
-    #[test]
-    fn cold_texture_scratch_is_released_without_touching_recent_reads() {
-        let now = std::time::Instant::now();
-        let mut read = super::ReadScratch { bytes: vec![7; 2 << 20], large_use: now };
-        assert!(read.take_idle(now, true).is_none());
-        let later = now + std::time::Duration::from_secs(3);
-        assert!(read.take_idle(later, false).is_none());
-        let old = read.take_idle(later, true).unwrap();
-        assert_eq!(old[0], 7);
-        assert_eq!(read.bytes.capacity(), 0);
-        read.bytes = vec![1; 1 << 20];
-        assert!(read.take_idle(later, true).is_none());
-    }
 
     #[test]
     fn a_zero_sparse_read_keeps_the_digest_of_the_staged_texels() {

@@ -18,7 +18,6 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
-static AVAILABLE_PHYSICAL: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 pub(crate) const UPLOAD_RETRY_MS: u64 = 500;
 
@@ -57,7 +56,6 @@ fn sample_commit(now: u64) -> u64 {
         && let Some(status) = memory_status()
     {
         AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
-        AVAILABLE_PHYSICAL.store(status.ullAvailPhys, Ordering::Relaxed);
     }
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
@@ -69,15 +67,11 @@ fn has_upload_reserve(commit: u64, bake: bool) -> bool {
     commit >= if bake { 256 * MIB } else { 512 * MIB }
 }
 
-fn has_growth_reserve(commit: u64, bytes: u64, physical: u64, bake: bool) -> bool {
+fn has_growth_reserve(commit: u64, bytes: u64, bake: bool) -> bool {
     // Growing a fresh 64 MiB upload block for speculative bindless prefetch
     // requires more headroom than reusing slices already committed inside the
     // staging pool.
-    // Pagefile headroom is not physical RAM. Only speculative growth is
-    // throttled here; reuse and required uploads keep their existing rules.
     commit.saturating_sub(bytes) >= if bake { 256 * MIB } else { 1024 * MIB }
-        && (bake || physical >= GIB)
-
 }
 
 /// Leave commit for game allocations and submissions already in flight while
@@ -108,12 +102,7 @@ fn allow_growth(bytes: u64, bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(
-        sample_commit(now),
-        bytes,
-        AVAILABLE_PHYSICAL.load(Ordering::Relaxed),
-        bake,
-    )
+    has_growth_reserve(sample_commit(now), bytes, bake)
 }
 
 /// A PC with 32 GiB of RAM or less, or `VICTORY_RESIDENCY_LIMITED=1` (the
@@ -166,12 +155,6 @@ pub(crate) fn headroom() -> Option<u64> {
     (bytes != u64::MAX).then_some(bytes)
 }
 
-/// Idle caches keep recent bursts warm. Pressure shortens the grace period,
-/// rather than making every return free memory that the next frame needs.
-pub(crate) fn cache_expired(age: std::time::Duration, pressure: bool) -> bool {
-    age >= std::time::Duration::from_secs(if pressure { 2 } else { 30 })
-}
-
 pub(crate) fn pressured() -> bool {
     PRESSURED.load(Ordering::Relaxed)
 }
@@ -221,34 +204,15 @@ mod tests {
         ] {
             assert_eq!(has_upload_reserve(commit, true), bake);
             assert_eq!(has_upload_reserve(commit, false), lookahead);
-            assert_eq!(has_growth_reserve(commit, 0, 8 * GIB, false), growth);
+            assert_eq!(has_growth_reserve(commit, 0, false), growth);
         }
     }
 
     #[test]
     fn a_second_buffer_counts_against_the_growth_reserve() {
-        assert!(!has_growth_reserve(GIB, 64 * MIB, 8 * GIB, false));
-        assert!(has_growth_reserve(GIB + 64 * MIB, 64 * MIB, 8 * GIB, false));
-        assert!(!has_growth_reserve(512 * MIB, GIB, 8 * GIB, false));
-    }
-
-    #[test]
-    fn pressure_trims_cold_caches_but_keeps_recent_bursts() {
-        use std::time::Duration;
-        assert!(!cache_expired(Duration::from_millis(1999), true));
-        assert!(cache_expired(Duration::from_secs(2), true));
-        assert!(!cache_expired(Duration::from_secs(2), false));
-        assert!(cache_expired(Duration::from_secs(30), false));
-    }
-
-    #[test]
-    fn pagefile_headroom_does_not_allow_speculation_to_exhaust_ram() {
-        assert!(!has_growth_reserve(32 * GIB, GIB - 1, 8 * GIB, false));
-        assert!(has_growth_reserve(32 * GIB, GIB, 8 * GIB, false));
-        assert!(!has_growth_reserve(512 * MIB, 0, 8 * GIB, false));
-        assert!(!has_growth_reserve(32 * GIB, 0, GIB - 1, false));
-        assert!(has_growth_reserve(256 * MIB, 0, 0, true));
-        assert!(has_upload_reserve(512 * MIB, false));
+        assert!(!has_growth_reserve(GIB, 64 * MIB, false));
+        assert!(has_growth_reserve(GIB + 64 * MIB, 64 * MIB, false));
+        assert!(!has_growth_reserve(512 * MIB, GIB, false));
     }
 
     #[test]
