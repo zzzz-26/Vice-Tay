@@ -64,8 +64,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    spares_for(memory, keep, crate::resource::room_percent().saturating_sub(5))
+}
+
+fn spares_for(memory: Option<[u64; 4]>, keep: bool, target_pct: u64) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * u128::from(target_pct) => SPARE_KEPT,
         _ => SPARE,
     }
 }
@@ -937,5 +941,15 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn spares_scales_with_room_target() {
+        let gib = 1 << 30;
+        assert_eq!(spares_for(Some([100 * gib, 84 * gib, 0, 0]), true, 85), SPARE_KEPT);
+        assert_eq!(spares_for(Some([100 * gib, 85 * gib, 0, 0]), true, 85), SPARE);
+        assert_eq!(spares_for(Some([100 * gib, 74 * gib, 0, 0]), true, 75), SPARE_KEPT);
+        assert_eq!(spares_for(Some([100 * gib, 75 * gib, 0, 0]), true, 75), SPARE);
+        assert_eq!(spares_for(Some([100 * gib, 10 * gib, 0, 0]), false, 85), SPARE);
     }
 }

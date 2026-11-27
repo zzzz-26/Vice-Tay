@@ -1255,9 +1255,7 @@ struct Hosted {
 #[cfg(windows)]
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0"))
 }
 
 /// The first level a placed texture's view shows: of views of one 2D
@@ -1629,10 +1627,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
+        // pick by index among them, for textures not made tiled above (such
+        // as those under `tiles::floor()`).
         let mut base = 0;
         let mut prefill = None;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
@@ -1770,7 +1769,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room())
+            used.saturating_sub(crate::pool::texture_room().saturating_add(crate::tiles::free_bytes()))
                 .saturating_add(crate::shadow::card_room_kept())
                 .saturating_add(targets_room_kept())
                 < budget / 100 * room_percent()
@@ -1837,7 +1836,7 @@ pub(crate) fn room_lately() -> bool {
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
 #[cfg(windows)]
-fn room_percent() -> u64 {
+pub(crate) fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
@@ -2125,7 +2124,8 @@ pub(crate) fn let_go_idle() {
     let (idle_ms, most) = match memory {
         _ if crate::residency::pressured() => (5_000, u64::MAX),
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let used = used
+                .saturating_sub(crate::pool::texture_room().saturating_add(crate::tiles::free_bytes()))
                 .saturating_add(crate::shadow::card_room_kept())
                 .saturating_add(targets_room_kept());
             crate::host::vram_keep(budget, used)
@@ -2214,6 +2214,8 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    drop(all);
+    reclaim_pending_tiles();
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2570,8 +2572,10 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Reserved textures must go through `CreateReservedResource`
+    // below instead of the pool.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2658,6 +2662,44 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
     host_tiled(this)?.tiled()?.first_shown()
 }
 
+/// Tiled host textures that have unheld standard mip levels waiting out the
+/// reclaim hysteresis window (`crate::tiles::Tiled::reclaim_unheld`).
+#[cfg(windows)]
+static PENDING_TILE_RECLAIM: std::sync::Mutex<Vec<std::sync::Weak<HostTexture>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Sweeps [`PENDING_TILE_RECLAIM`] outside `TEXTURES` and `r.host.made` locks,
+/// unmapping any standard mip levels that have stayed unheld past hysteresis.
+#[cfg(windows)]
+fn reclaim_pending_tiles() {
+    let entries = {
+        let mut queue = PENDING_TILE_RECLAIM.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *queue)
+    };
+    let mut keep = Vec::new();
+    for weak in entries {
+        let Some(host) = weak.upgrade() else {
+            continue;
+        };
+        let Some(tiled) = &host.tiled else {
+            continue;
+        };
+        tiled.reclaim_unheld(&host.texture);
+        if tiled.finish_reclaim_sweep() {
+            keep.push(weak);
+        }
+    }
+    if !keep.is_empty() {
+        PENDING_TILE_RECLAIM
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(keep);
+    }
+}
+
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
@@ -2680,7 +2722,9 @@ impl OnDemand {
     /// [`crate::tiles::Tiled::uploaded`]; `memory`: where the texture's
     /// title memory starts (its slots are made again if the first level
     /// they may show changed).
-    /// Held levels get tiles only while the card has room ([`room`]).
+    /// Standard held levels get tiles only while the card has room ([`room`]);
+    /// when out of room, tiny packed tail levels can still draw from existing
+    /// free tiles in the tile pool.
     /// Returns whether a level is still without its tiles: the caller
     /// records the upload again later.
     pub(crate) fn uploaded(&self, held: u32, memory: u64) -> bool {
@@ -2688,6 +2732,12 @@ impl OnDemand {
             return false;
         };
         let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
+        if tiled.try_queue_reclaim() {
+            PENDING_TILE_RECLAIM
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(std::sync::Arc::downgrade(&self.0));
+        }
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
@@ -4893,5 +4943,39 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Regression test: `host_texture_as(..., reserved = true)` must bypass the
+    /// texture pool and create an actual reserved resource that `Tiled::make`
+    /// accepts even when `VICTORY_TEXTURE_POOL` is enabled.
+    #[cfg(windows)]
+    #[test]
+    fn reserved_texture_bypasses_pool_and_supports_tiling() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut options = windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: plain feature query into a struct of its own size.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        if ok.is_err() || options.TiledResourcesTier.0 < 2 {
+            return;
+        }
+        // 1024x1024 BC7, 11 levels, 4 KiB blocks.
+        let raw = [3u32, 0, 0, 0, 1024, 0, 1024, 0x000b_0001, 98, 1, 0, 0x105, 0, 0];
+        // SAFETY: 56 bytes in ResourceDesc layout.
+        let desc = unsafe { raw.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        let tex = host_texture_as(&desc, 0, std::ptr::null(), true, true)
+            .expect("CreateReservedResource should succeed");
+        let tiled = crate::tiles::Tiled::make(&host.device, &tex, u32::from(desc.mip_levels));
+        assert!(
+            tiled.is_some(),
+            "reserved texture must not come from the non-reserved texture pool"
+        );
     }
 }

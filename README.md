@@ -180,7 +180,7 @@ DLSS also runs under Proton. Set `PROTON_ENABLE_NVAPI=1` and point `VICTORY_DLSS
 
 ## Known problems
 
-- **RX 6700 XT on Windows 11 LTSC.** Drivers 32.0.21045.26001 and 32.0.32029.2010 can reset the device while loading the world. The AMD launcher profile defaults to relay mode 0 on those drivers. See [#138](https://github.com/TaynanGT/Vice-Tay/issues/138) for the reported runs. The launcher still accepts an explicit relay mode through its settings override.
+- **RDNA2 world-load resets on Windows 11.** The AMD launcher profile defaults to relay mode 0 on the RX 6700 XT with drivers 32.0.21045.26001 or 32.0.32029.2010 on LTSC, and on the RX 6900 XT with driver 32.0.21045.29003 on all Windows 11 editions. The launcher accepts an explicit relay mode through its settings override. See the test reports in [#138](https://github.com/TaynanGT/Vice-Tay/issues/138).
 - **Frame time.** The 30-minute run recorded a median frame time of 47.3 ms, with 33.7 ms for CPU-side submission preparation and 12.6 ms for GPU read-back. [Frame breakdown](docs/measurements.md#series-s-baseline)
 - **Memory pressure.** The five-minute overlay session peaked at 27.1 GB of private game memory. Low free RAM can lead to paging and long stalls. [Memory findings](docs/findings-rtx4090.md)
 - **Rendering.** Colour banding, flat-colour surfaces, blocky clouds and reflections, and missing or incorrect shading remain visible in some scenes. Ray-traced indirect lighting requires `-RayTracing`.

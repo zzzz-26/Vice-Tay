@@ -55,17 +55,21 @@ if ($Machine -eq '7900xtx') {
     # thread, and the AMD driver lowers its clocks between submissions.
     $settings.VICTORY_MAP_THREADS = '1'; $settings.VICTORY_CARD_AWAKE = '1'
 
-    # Issue #138 reported device resets in relay modes 1 and 2 on these drivers.
+    # Issue #138: these driver and adapter combinations can reset at world load.
     if (-not $hasNvidia -and -not $More.ContainsKey('VICTORY_RELAY')) {
-        $affected = $controllers | Where-Object {
-            $_.PNPDeviceID -match 'VEN_1002' -and $_.Name -match '\bRX\s+6700\s+XT\b' -and
-                $_.DriverVersion -in '32.0.21045.26001', '32.0.32029.2010'
-        } | Select-Object -First 1
-        if ($affected) {
-            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-            if (($os.BuildNumber -as [int]) -ge 22000 -and $os.Caption -match '\bLTSC\b') {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        if (($os.BuildNumber -as [int]) -ge 22000) {
+            $ltsc = $os.Caption -match '\bLTSC\b'
+            $affected = $controllers | Where-Object {
+                $_.PNPDeviceID -match 'VEN_1002' -and (
+                    ($ltsc -and $_.Name -match '\bRX\s+6700\s+XT\b' -and
+                        $_.DriverVersion -in '32.0.21045.26001', '32.0.32029.2010') -or
+                    ($_.Name -match '\bRX\s+6900\s+XT\b' -and $_.DriverVersion -eq '32.0.21045.29003')
+                )
+            } | Select-Object -First 1
+            if ($affected) {
                 $settings.VICTORY_RELAY = '0'
-                Write-Host "Using relay mode 0 for the RX 6700 XT on Windows 11 LTSC (driver $($affected.DriverVersion), issue #138)."
+                Write-Host "Using relay mode 0 for $($affected.Name) on $($os.Caption) (driver $($affected.DriverVersion), issue #138)."
             }
         }
     }

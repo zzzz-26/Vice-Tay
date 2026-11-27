@@ -38,10 +38,12 @@
 //!   that is held and has tiles ([`show_from`], `descriptor/host.rs`
 //!   `make`), and the slots of a texture are made again when that level
 //!   changes (`HostHeap::texture_views_remade`).
-//! - shortcut: tiles are not taken back while the host copy lives. A level
-//!   the title lets go of, or that turns out to be the next texture's,
-//!   keeps its tiles; it is hidden by the views and written with zeros at
-//!   the next upload. Its tiles go back when the host copy does.
+//! - Standard mip levels that the title later drops (unmapped or overwritten
+//!   by the next texture) are unmapped via `D3D12_TILE_RANGE_FLAG_NULL` after
+//!   a hysteresis delay (`RECLAIM_HYSTERESIS_MS`) once views no longer reach
+//!   them (`level < shown`), and their heap tiles are retired back to the pool
+//!   after in-flight submissions complete. Remaining tiles return when the
+//!   host copy drops.
 //!
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
@@ -68,8 +70,14 @@ const HEAP_TILES: u32 = 1024;
 /// the pool's heaps; such textures made in all; levels given; calls of
 /// `UpdateTileMappings`; their microseconds; heaps given back to the card;
 /// uploads that left a held level without tiles (the card had no room, or
-/// no heap could be had); uploads recorded again for such a level.
-pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// no heap could be had); uploads recorded again for such a level;
+/// standard levels reclaimed after going unheld; bytes reclaimed.
+pub(crate) static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+
+/// Milliseconds a mapped standard level must stay unheld (and strictly more
+/// detailed than `shown`) before its tiles are unmapped and retired back to
+/// the pool.
+const RECLAIM_HYSTERESIS_MS: u64 = 3_000;
 
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
@@ -126,6 +134,16 @@ pub(crate) fn given_total() -> u64 {
     STATS[2].load(Ordering::Relaxed)
 }
 
+/// Free bytes already allocated inside the tile pool's existing heaps (not
+/// currently backing any texture or pending retired [`TileLease`]). Because
+/// `STATS[2]` only drops when a lease or texture drops, this stays
+/// conservative while retired tiles wait on GPU submissions.
+pub(crate) fn free_bytes() -> u64 {
+    STATS[3]
+        .load(Ordering::Relaxed)
+        .saturating_sub(STATS[2].load(Ordering::Relaxed))
+}
+
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
 /// order, no two touching.
 struct Heap {
@@ -150,8 +168,8 @@ static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
 /// the heap, its place in the pool and the runs (first tile, tiles). A new
-/// heap is made when no heap has that many free.
-fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+/// heap is made when no heap has that many free and `allow_new_heap` is true.
+fn take(device: &ID3D12Device, count: u32, allow_new_heap: bool) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
     if count == 0 || count > HEAP_TILES {
         return None;
     }
@@ -160,6 +178,9 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     let index = match found {
         Some(index) => index,
         None => {
+            if !allow_new_heap {
+                return None;
+            }
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: u64::from(HEAP_TILES) * TILE,
                 Properties: D3D12_HEAP_PROPERTIES {
@@ -211,9 +232,8 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
 
 /// Gives the runs `runs` of the pool's heap at `index` back; runs that
 /// touch become one. A heap with every tile free goes back to the card,
-/// unless it is the pool's only one. (Called when the texture that held
-/// the tiles is dropped: nothing on the card reads through its mappings
-/// any more, as for any host texture that is dropped.)
+/// unless it is the pool's only one. (Called when a texture or a retired
+/// [`TileLease`] drops, once no submission on the card reads those tiles.)
 fn give_back(index: usize, runs: &[(u32, u32)]) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(h)) = pool.get_mut(index) else {
@@ -237,14 +257,46 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
     }
 }
 
+fn return_runs(runs: &[(usize, u32, u32)]) {
+    if runs.is_empty() {
+        return;
+    }
+    let mut bytes = 0u64;
+    let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+    for &(index, start, tiles) in runs {
+        by_heap.entry(index).or_default().push((start, tiles));
+        bytes += u64::from(tiles) * TILE;
+    }
+    for (index, heap_runs) in by_heap {
+        give_back(index, &heap_runs);
+    }
+    STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// Tile runs unmapped from a live reserved texture; retired via
+/// `crate::host::retire` so their heap tiles only return to `POOL` once all
+/// in-flight and queued submissions have finished.
+pub(crate) struct TileLease(Vec<(usize, u32, u32)>);
+
+impl Drop for TileLease {
+    fn drop(&mut self) {
+        return_runs(&self.0);
+    }
+}
+
 /// What is given so far to one texture.
 struct Given {
     /// Per level with tiles of its own: whether it has them.
     levels: Vec<bool>,
     /// Whether the small levels the card packs together have theirs.
     packed: bool,
-    /// The runs taken: the heap's place, first tile, tiles.
-    runs: Vec<(usize, u32, u32)>,
+    /// Runs taken per standard level: the heap's place, first tile, tiles.
+    level_runs: Vec<Vec<(usize, u32, u32)>>,
+    /// Runs taken for the packed small levels.
+    packed_runs: Vec<(usize, u32, u32)>,
+    /// Timestamp (`host::now_ms`, >= 1) when a mapped standard level first
+    /// became unheld and strictly above `shown`, or 0.
+    unheld_since: Vec<u64>,
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -271,6 +323,12 @@ pub(crate) struct Tiled {
     /// The levels a recorded list of the card's own writes has already
     /// written with zeros first ([`Tiled::claim`]).
     claimed: AtomicU32,
+    /// Bitmask of mapped standard levels currently waiting out
+    /// `RECLAIM_HYSTERESIS_MS` so the idle sweep can skip textures with
+    /// nothing to reclaim without taking `given`'s lock.
+    pending_reclaim: AtomicU32,
+    /// Whether this texture is already queued in `resource::PENDING_TILE_RECLAIM`.
+    reclaim_queued: std::sync::atomic::AtomicBool,
 }
 
 impl Tiled {
@@ -323,11 +381,14 @@ impl Tiled {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(full, Ordering::Relaxed);
         STATS[4].fetch_add(1, Ordering::Relaxed);
+        let standard_count = standard.len();
         Some(Tiled {
             given: Mutex::new(Given {
-                levels: vec![false; standard.len()],
+                levels: vec![false; standard_count],
                 packed: false,
-                runs: Vec::new(),
+                level_runs: vec![Vec::new(); standard_count],
+                packed_runs: Vec::new(),
+                unheld_since: vec![0; standard_count],
             }),
             standard,
             packed: packed_tiles,
@@ -337,6 +398,8 @@ impl Tiled {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            pending_reclaim: AtomicU32::new(0),
+            reclaim_queued: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -344,20 +407,24 @@ impl Tiled {
     /// from its staging buffer, of which `held` are the title's now (the
     /// others are zeros there): tiles for the held ones that have none.
     /// `room`: whether the card has room for more host copies
-    /// (`resource.rs` `room`). Without room no held level gets tiles: the
-    /// list still brings the levels that have theirs up to date (which
-    /// takes none of the card's memory), and its copies into the others go
-    /// nowhere. (An upload of a host copy that exists passes the full
-    /// card's gate in `draw.rs` on the ground that it takes no memory;
-    /// with tiles given here regardless, the line would not bound these
-    /// textures.)
+    /// (`resource.rs` `room`). Without room, standard held levels wait (only
+    /// card-written levels and, if free tiles already exist in the pool, the
+    /// tiny packed tail levels get tiles): the list still brings levels that
+    /// already have tiles up to date, and its copies into unmapped levels go
+    /// nowhere.
     /// Returns whether the first level a view may show changed, and
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
     /// the level would stay empty until the title writes the texture.
     pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
+            Some(host) => {
+                let res = self.uploaded_on(host.queue(), &host.device, texture, held, room);
+                if let Some(lease) = self.reclaim_unheld_on(host.queue(), texture, crate::host::now_ms().max(1)) {
+                    crate::host::retire(lease);
+                }
+                res
+            }
             None => (false, false),
         }
     }
@@ -377,10 +444,138 @@ impl Tiled {
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
-        // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        // waiting: a write of the card's into no memory is lost. When out of
+        // room, still grant the tiny packed tail levels (typically 1 tile /
+        // 64 KiB) so surfaces render blurry instead of gray while large
+        // standard levels wait for room.
+        let first_packed = self.standard.len() as u32;
+        let packed_mask = if self.packed > 0 && first_packed < 32 {
+            self.every_level() & !((1u32 << first_packed) - 1)
+        } else {
+            0
+        };
+        let may = if room { named } else { card | (held & packed_mask) };
+        let allow_new_heap = if room { named } else { card };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may, allow_new_heap);
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
+    }
+
+    /// Whether any mapped standard level is waiting to be reclaimed.
+    pub(crate) fn has_pending_reclaim(&self) -> bool {
+        self.pending_reclaim.load(Ordering::Relaxed) != 0
+    }
+
+    /// Marks this texture as queued for idle reclaim if it has pending
+    /// unheld levels and is not already queued.
+    pub(crate) fn try_queue_reclaim(&self) -> bool {
+        self.has_pending_reclaim()
+            && !self.reclaim_queued.swap(true, Ordering::AcqRel)
+    }
+
+    /// Clears the queued flag after the idle sweep checks this texture;
+    /// returns `true` if new pending levels arrived concurrently so the
+    /// caller should keep it queued.
+    pub(crate) fn finish_reclaim_sweep(&self) -> bool {
+        if self.has_pending_reclaim() {
+            return true;
+        }
+        self.reclaim_queued.store(false, Ordering::Release);
+        if self.has_pending_reclaim() && !self.reclaim_queued.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        false
+    }
+
+    /// Reclaims mapped standard levels that have stayed unheld (and strictly
+    /// above `shown`) past `RECLAIM_HYSTERESIS_MS`, retiring their heap runs
+    /// until in-flight GPU submissions finish.
+    pub(crate) fn reclaim_unheld(&self, texture: &ID3D12Resource) {
+        if !self.has_pending_reclaim() {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if let Some(lease) = self.reclaim_unheld_on(host.queue(), texture, crate::host::now_ms().max(1)) {
+            crate::host::retire(lease);
+        }
+    }
+
+    /// [`Tiled::reclaim_unheld`] on an explicit queue and clock, returning
+    /// the retired [`TileLease`] if any standard levels were unmapped.
+    pub(crate) fn reclaim_unheld_on(
+        &self,
+        queue: &ID3D12CommandQueue,
+        texture: &ID3D12Resource,
+        now_ms: u64,
+    ) -> Option<TileLease> {
+        if self.pending_reclaim.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
+        let claimed = self.claimed.load(Ordering::Relaxed);
+        let shown = self.shown.load(Ordering::Relaxed);
+        let mut freed: Vec<(usize, u32, u32)> = Vec::new();
+        let mut still_pending = 0u32;
+        for level in 0..self.standard.len() {
+            let bit = 1u32 << level;
+            if !given.levels[level] || (named & bit != 0) || (claimed & bit != 0) || (level as u32) >= shown {
+                given.unheld_since[level] = 0;
+                continue;
+            }
+            let since = given.unheld_since[level];
+            if since == 0 {
+                continue;
+            }
+            if now_ms.saturating_sub(since) < RECLAIM_HYSTERESIS_MS {
+                still_pending |= bit;
+                continue;
+            }
+            let tiles = self.standard[level];
+            let at = D3D12_TILED_RESOURCE_COORDINATE {
+                X: 0,
+                Y: 0,
+                Z: 0,
+                Subresource: level as u32,
+            };
+            let size = D3D12_TILE_REGION_SIZE {
+                NumTiles: tiles,
+                ..Default::default()
+            };
+            let flag = D3D12_TILE_RANGE_FLAG_NULL;
+            let began = std::time::Instant::now();
+            // SAFETY: a live reserved texture on tiled-resources tier >= 2;
+            // one NULL range unmapping all `tiles` tiles of this standard
+            // subresource. Unmapping is safe because the upload that dropped
+            // the level already wrote zeros to it and tier >= 2 reads unmapped
+            // tiles as zeros (no fault); `RECLAIM_HYSTERESIS_MS` only avoids
+            // thrashing.
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture,
+                    1,
+                    Some(&raw const at),
+                    Some(&raw const size),
+                    None,
+                    1,
+                    Some(&raw const flag),
+                    None,
+                    Some(&raw const tiles),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            STATS[11].fetch_add(1, Ordering::Relaxed);
+            STATS[12].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
+            given.levels[level] = false;
+            given.unheld_since[level] = 0;
+            freed.append(&mut given.level_runs[level]);
+        }
+        self.pending_reclaim.store(still_pending, Ordering::Relaxed);
+        (!freed.is_empty()).then_some(TileLease(freed))
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -408,24 +603,33 @@ impl Tiled {
         let levels = levels & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let prev = self.card.load(Ordering::Relaxed);
+        let claimed = self.claimed.load(Ordering::Relaxed);
+        // Only grant tiles to levels that either already have tiles or were
+        // claimed (zeroed by a recorded list): if a previously held level was
+        // reclaimed between record and submit, leaving it unmapped drops the
+        // partial write to zeros rather than exposing another texture's tiles.
+        let already = levels & !self.without_locked(&given, levels);
+        let safe = already | (levels & claimed);
         let changed = self.give_locked(
             &mut given,
             queue,
             device,
             texture,
-            prev | levels | self.held.load(Ordering::Relaxed),
-            levels,
+            prev | safe | self.held.load(Ordering::Relaxed),
+            safe,
+            safe,
         );
         // Only levels that actually received tiles (or already had them) saw
         // the card's write; a level that got no tiles saw its zeros and write
         // dropped, so neither `card` nor `claimed` should keep it.
         let without = self.without_locked(&given, levels);
-        let backed = levels & !without;
+        let backed = safe & !without;
         if backed != 0 {
             self.card.fetch_or(backed, Ordering::Relaxed);
         }
-        if without != 0 {
-            self.unclaim(without);
+        let unclaim = without & claimed;
+        if unclaim != 0 {
+            self.unclaim(unclaim);
         }
         changed
     }
@@ -504,9 +708,10 @@ impl Tiled {
         may: u32,
     ) -> bool {
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        self.give_locked(&mut given, queue, device, texture, named, may)
+        self.give_locked(&mut given, queue, device, texture, named, may, may)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn give_locked(
         &self,
         given: &mut Given,
@@ -515,22 +720,25 @@ impl Tiled {
         texture: &ID3D12Resource,
         named: u32,
         may: u32,
+        allow_new_heap: u32,
     ) -> bool {
         let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
+        let new_heap = |level: u32| level < 32 && allow_new_heap & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
-        // (subresource, tiles, the level if it has tiles of its own) to map now.
-        let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
+        // (subresource, tiles, the level if it has tiles of its own, allow_new_heap) to map now.
+        let mut wanted: Vec<(u32, u32, Option<usize>, bool)> = Vec::new();
         for level in 0..first_packed {
             if !given.levels[level as usize] && now(level) {
-                wanted.push((level, self.standard[level as usize], Some(level as usize)));
+                wanted.push((level, self.standard[level as usize], Some(level as usize), new_heap(level)));
             }
         }
         if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
-            wanted.push((first_packed, self.packed, None));
+            let allow = (first_packed..self.levels).any(|l| now(l) && new_heap(l));
+            wanted.push((first_packed, self.packed, None, allow));
         }
-        for (subresource, tiles, level) in wanted {
-            let Some((heap, index, runs)) = take(device, tiles) else {
+        for (subresource, tiles, level, allow) in wanted {
+            let Some((heap, index, runs)) = take(device, tiles, allow) else {
                 continue;
             };
             let at = D3D12_TILED_RESOURCE_COORDINATE {
@@ -570,11 +778,19 @@ impl Tiled {
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             match level {
-                Some(level) => given.levels[level] = true,
-                None => given.packed = true,
-            }
-            for &(start, count) in &runs {
-                given.runs.push((index, start, count));
+                Some(level) => {
+                    given.levels[level] = true;
+                    given.unheld_since[level] = 0;
+                    for &(start, count) in &runs {
+                        given.level_runs[level].push((index, start, count));
+                    }
+                }
+                None => {
+                    given.packed = true;
+                    for &(start, count) in &runs {
+                        given.packed_runs.push((index, start, count));
+                    }
+                }
             }
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
@@ -587,6 +803,20 @@ impl Tiled {
             }
         };
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
+        let now_ms = crate::host::now_ms().max(1);
+        let mut pending = 0u32;
+        for level in 0..self.standard.len() {
+            let bit = 1u32 << level;
+            if given.levels[level] && !has(level as u32) && (level as u32) < shown {
+                if given.unheld_since[level] == 0 {
+                    given.unheld_since[level] = now_ms;
+                }
+                pending |= bit;
+            } else {
+                given.unheld_since[level] = 0;
+            }
+        }
+        self.pending_reclaim.store(pending, Ordering::Relaxed);
         self.shown.swap(shown, Ordering::Relaxed) != shown
     }
 
@@ -623,25 +853,29 @@ impl Tiled {
     /// The bytes of the tiles it has now.
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
+        given
+            .level_runs
+            .iter()
+            .flatten()
+            .chain(given.packed_runs.iter())
+            .map(|run| u64::from(run.2) * TILE)
+            .sum()
     }
 }
 
 impl Drop for Tiled {
     fn drop(&mut self) {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
-        let mut bytes = 0;
-        let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
-        for &(index, start, tiles) in &given.runs {
-            by_heap.entry(index).or_default().push((start, tiles));
-            bytes += u64::from(tiles) * TILE;
-        }
-        for (index, runs) in by_heap {
-            give_back(index, &runs);
-        }
+        let all: Vec<(usize, u32, u32)> = given
+            .level_runs
+            .iter()
+            .flatten()
+            .chain(given.packed_runs.iter())
+            .copied()
+            .collect();
+        return_runs(&all);
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
-        STATS[2].fetch_sub(bytes, Ordering::Relaxed);
     }
 }
 
@@ -692,9 +926,9 @@ pub(crate) fn status() {
     tracing::info!(
         "textures with levels on demand: {} alive ({} made so far), {} MB of the card given to {} levels in all, \
          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
-         the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
-         UpdateTileMappings in {} microseconds; in all {} calls, {} microseconds; {} uploads left a held \
-         level without memory (no room on the card, or no heap), {} uploads were recorded again for one",
+         the pool's heaps {} MB ({} given back to the card so far); {} standard levels reclaimed ({} MB); \
+         since the line before: {} calls of UpdateTileMappings in {} microseconds; in all {} calls, {} microseconds; \
+         {} uploads left a held level without memory (no room on the card, or no heap), {} uploads were recorded again for one",
         s[0],
         s[4],
         s[2] >> 20,
@@ -703,6 +937,8 @@ pub(crate) fn status() {
         s[1] >> 20,
         s[3] >> 20,
         s[8],
+        s[11],
+        s[12] >> 20,
         calls,
         micros,
         s[6],
@@ -1220,12 +1456,12 @@ void look() {
         let upload = rig.filled(&layout, |_| 0xa5);
         let read = rig.round_trip(&first, &layout, Some(&upload));
         assert!(all(&read[level as usize], 0xa5));
-        let runs = first_tiles.given.lock().unwrap().runs.clone();
+        let runs = first_tiles.given.lock().unwrap().level_runs[level as usize].clone();
         drop(first_tiles);
         drop(first);
         let (second, second_tiles) = rig.reserved(&desc);
         rig.give(&second_tiles, &second, 1 << level);
-        let reused = second_tiles.given.lock().unwrap().runs == runs;
+        let reused = second_tiles.given.lock().unwrap().level_runs[level as usize] == runs;
         let unwritten = rig.round_trip(&second, &layout, None);
         eprintln!(
             "a level given tiles and not written reads {:?} (its tiles are the first texture's: {reused})",
@@ -1243,7 +1479,7 @@ void look() {
         rig.step = "step 4, a level on several ranges of the heap";
         // Three single tiles; the first and the last go back, the middle
         // one stays taken.
-        let singles: Vec<_> = (0..3).map(|_| take(&rig.device, 1).expect("a tile")).collect();
+        let singles: Vec<_> = (0..3).map(|_| take(&rig.device, 1, true).expect("a tile")).collect();
         give_back(singles[0].1, &singles[0].2);
         give_back(singles[2].1, &singles[2].2);
         let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
@@ -1252,7 +1488,7 @@ void look() {
         // Level 1 of a 1024 texture: four tiles.
         assert!(tiled.standard.len() > 1 && tiled.standard[1] >= 2);
         rig.give(&tiled, &texture, 1 << 1);
-        let runs = tiled.given.lock().unwrap().runs.len();
+        let runs = tiled.given.lock().unwrap().level_runs[1].len();
         eprintln!("level 1 ({} tiles) was mapped on {runs} ranges", tiled.standard[1]);
         assert!(runs >= 2, "the single free tiles were not used first");
         let upload = rig.filled(&layout, |_| 0x77);
@@ -1373,18 +1609,30 @@ void look() {
                 assert!(all(bytes, want), "{what}: level {level} reads {bytes:?}, wanted {want}");
             }
         };
-        // No room: nothing is given, the held levels are said to wait,
-        // nothing is shown, every level reads zeros.
+        // No room: standard levels wait, while packed tail levels (if any)
+        // still get their tiny tile so surfaces show blurry instead of gray.
+        // (The software adapter gives every level of this texture tiles of
+        // its own; the card packs level 3 and those after it.)
+        let first_packed = tiled.standard.len() as u32;
         let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), false);
         rig.check("an upload without room");
-        assert!(!changed && waiting, "without room: changed {changed}, waiting {waiting}");
-        assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
-        assert_eq!(tiled.first_shown(), None);
+        assert_eq!(waiting, first_packed > 3, "without room standard levels wait, packed ones do not");
+        if tiled.packed > 0 {
+            assert!(changed, "packed tail should be granted even without room");
+            assert_eq!(tiled.given_bytes(), u64::from(tiled.packed) * TILE);
+            assert_eq!(tiled.first_shown(), Some(first_packed.max(3)));
+        } else {
+            assert!(!changed);
+            assert_eq!(tiled.given_bytes(), 0);
+            assert_eq!(tiled.first_shown(), None);
+        }
+        assert_eq!(tiled.has_tiles(3), first_packed <= 3, "a standard level 3 must wait without room");
         read_as_given(rig, "without room");
-        // Asked again with room: the same levels get theirs.
+        // Asked again with room: the same levels get theirs (all of them had
+        // theirs already where level 3 is a packed one).
         let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
         rig.check("the upload again, with room");
-        assert!(changed && !waiting, "with room: changed {changed}, waiting {waiting}");
+        assert!(changed == (first_packed > 3) && !waiting, "with room: changed {changed}, waiting {waiting}");
         assert!(tiled.has_tiles(3) && !tiled.has_tiles(2));
         assert_eq!(tiled.first_shown(), Some(3));
         read_as_given(rig, "with room");
@@ -1430,6 +1678,62 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
+    fn unheld_standard_levels_are_reclaimed(rig: &mut Rig) {
+        rig.step = "step 8, standard levels that go unheld are reclaimed after hysteresis";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        let layout = rig.footprints(&desc);
+        let upload = rig.filled(&layout, |level| level as u8 + 11);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(0), true);
+        rig.check("all levels given");
+        assert!(changed && !waiting && tiled.whole());
+        let full_bytes = tiled.given_bytes();
+        // Title drops levels 0 and 1: shown moves to level 2, levels 0 and 1
+        // are marked pending reclaim.
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(2), true);
+        rig.check("top levels unheld");
+        assert!(changed && !waiting);
+        assert_eq!(tiled.first_shown(), Some(2));
+        assert!(tiled.has_pending_reclaim());
+        // Before hysteresis expires, nothing is unmapped yet.
+        let now = crate::host::now_ms().max(1);
+        assert!(tiled.reclaim_unheld_on(&rig.queue, &texture, now).is_none());
+        assert!(tiled.has_tiles(0) && tiled.has_tiles(1));
+        // Past hysteresis, levels 0 and 1 are unmapped and their tiles returned.
+        let lease = tiled
+            .reclaim_unheld_on(&rig.queue, &texture, now.saturating_add(RECLAIM_HYSTERESIS_MS))
+            .expect("levels 0 and 1 should be reclaimed past hysteresis");
+        rig.check("levels 0 and 1 unmapped");
+        assert!(!tiled.has_tiles(0) && !tiled.has_tiles(1) && tiled.has_tiles(2));
+        assert!(!tiled.has_pending_reclaim());
+        let expected_freed = u64::from(tiled.standard[0] + tiled.standard[1]) * TILE;
+        assert_eq!(tiled.given_bytes(), full_bytes - expected_freed);
+        // Unmapped level can be claimed again if needed.
+        assert_eq!(tiled.claim(1 << 0), 1 << 0);
+        tiled.unclaim(1 << 0);
+        // Verify unmapped levels read 0 while remaining levels stay intact.
+        let read = rig.round_trip(&texture, &layout, None);
+        assert!(all(&read[0], 0) && all(&read[1], 0));
+        // An unzeroed card write (without `claim`) to the just-reclaimed level
+        // must NOT allocate fresh unzeroed tiles or set `card`.
+        let changed_unclaimed = tiled.card_wrote_on(&rig.queue, &rig.device, &texture, 1 << 0);
+        assert!(!changed_unclaimed && !tiled.has_tiles(0));
+        assert_eq!(tiled.card.load(Ordering::Relaxed) & (1 << 0), 0);
+        // Drop lease after GPU work finishes so tiles return cleanly to POOL
+        // and `free_bytes()` reflects the newly available tile-pool space.
+        let free_before = free_bytes();
+        drop(lease);
+        assert!(free_bytes() >= free_before, "dropping lease should return tiles to free_bytes()");
+        // Streaming level 0 back in maps and uploads it cleanly again.
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(0), true);
+        rig.check("levels 0 and 1 re-mapped");
+        assert!(changed && !waiting && tiled.whole());
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        for (level, bytes) in read.iter().enumerate() {
+            assert!(all(bytes, level as u8 + 11), "level {level} after re-map");
+        }
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1446,6 +1750,7 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
+        unheld_standard_levels_are_reclaimed(&mut rig);
         for (min_lod, expected) in [(0.0, [32, 0]), (3.0, [64, 64])] {
             let Some(read) = sample_resident_views(&mut rig, min_lod) else {
                 eprintln!("the view test's shader or objects could not be made; that part was skipped");
@@ -1562,12 +1867,16 @@ void look() {
             given: Mutex::new(Given {
                 levels: vec![false, false],
                 packed: false,
-                runs: Vec::new(),
+                level_runs: vec![Vec::new(); 2],
+                packed_runs: Vec::new(),
+                unheld_since: vec![0; 2],
             }),
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            pending_reclaim: AtomicU32::new(0),
+            reclaim_queued: std::sync::atomic::AtomicBool::new(false),
         };
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);

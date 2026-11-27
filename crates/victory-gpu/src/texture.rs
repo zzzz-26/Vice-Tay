@@ -749,7 +749,11 @@ pub(crate) struct Digest(pub(crate) u128);
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
-    let first = if crate::resource::held_only() { first } else { 0 };
+    let first = if crate::resource::held_only() && crate::resource::host_tiled(resource).is_none() {
+        first
+    } else {
+        0
+    };
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2001,9 +2005,11 @@ fn mapped_texture_blocks(start: usize, end: usize) -> u64 {
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
-    // Asked before the table is locked: the sweep lets go of a staging
-    // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
+    // Tiled (`on_demand`) textures must stage every mip from level 0 so
+    // `record_upload` writes any newly mapped level; non-tiled textures keep
+    // per-view `first` trimming when `held_only()` is active.
+    let on_demand = copy.tiled.is_some();
+    let first = if on_demand { 0 } else { first };
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))

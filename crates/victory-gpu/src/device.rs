@@ -348,12 +348,18 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// id, out)` and asks for `ID3D12PipelineState`. They load pipelines the
+/// title keeps precompiled: a description holds the root signature, then
+/// for each stage its metadata and native code (0x1c8: graphics, in runs of
+/// thousands of calls; 0x218: compute). On failure the title builds the
+/// pipeline the usual way: in a run of the RTX 5080 under Proton, each
+/// of the 2,689 failed 0x218 calls was followed on the same thread by
+/// `create_compute`, and the 10,232 failed 0x1c8 calls at the start by some
+/// 50,000 `create_stream` calls within 0.2 s (16,371 and 80,000 a minute
+/// later). The title's own log names the compute one:
+/// `DeserializeComputePipelineStateX FAILED hr=0x80004001 ... falling back`.
+/// So nothing is missing for want of these two; they would only save the
+/// title its fallback.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
@@ -388,12 +394,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
+        tracing::info!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "a precompiled pipeline the title asks for is not loaded (not implemented): it builds the pipeline the usual way instead"
         );
     }
     E_NOTIMPL

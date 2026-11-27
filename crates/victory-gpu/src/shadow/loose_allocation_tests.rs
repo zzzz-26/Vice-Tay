@@ -477,19 +477,15 @@ fn exact_eviction_keeps_held_entries_and_uses_publish_time_tick() {
     }
     let fixture = CellFixture::new(1);
     let base = fixture.cells[0];
-    let (idle_addr, held_addr, slow_addr, trigger_addr) =
-        (base, base + 256, base + 512, base + 768);
+    let (idle_addr, held_addr, slow_addr) = (base, base + 256, base + 512);
     let make = |size: u64| host()?.shared_buffer(size);
 
-    // Insert one idle entry (immediately dropped by caller) and one held entry.
     let idle = exact_with_limits(idle_addr, 256, 2, 2, make).unwrap();
     drop(idle);
     let held = exact_with_limits(held_addr, 256, 2, 2, make).unwrap();
 
-    // Start a slow allocation for `slow_addr`; while it is paused, advance
-    // `EXACT_TICK` past `lately = 2` so `idle_addr` becomes stale and
-    // `slow_addr`'s original `now` would look stale if not refreshed on publish.
-    std::thread::scope(|scope| {
+    // Age the idle entry while the slow allocation is blocked.
+    let (slow, before_publish) = std::thread::scope(|scope| {
         let (ready, waiting) = channel();
         let (go, resume) = channel();
         let worker = scope.spawn(move || {
@@ -502,32 +498,23 @@ fn exact_eviction_keeps_held_entries_and_uses_publish_time_tick() {
         for _ in 0..4 {
             let _ = exact_with_limits(held_addr, 256, 2, 2, make).unwrap();
         }
+        let before_publish = EXACT_TICK.load(Ordering::Relaxed);
         go.send(()).unwrap();
-        let slow = worker.join().unwrap();
-        // Drop external reference to `slow`; its publish-time tick must keep it
-        // alive across the next eviction sweep (`lately = 2`, 1 tick later).
-        drop(slow);
+        (worker.join().unwrap(), before_publish)
     });
 
-    // `idle_addr` must have been evicted during `slow_addr`'s publish sweep,
-    // while `held_addr` stayed because the caller held an `Arc`.
-    {
-        let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
-        assert!(!map.contains_key(&(idle_addr, 256)), "idle exact entry must be evicted");
-        assert!(map.contains_key(&(held_addr, 256)), "held exact entry must be retained");
-        assert!(map.contains_key(&(slow_addr, 256)), "freshly published entry must be present");
-    }
-
-    // One more miss (`trigger_addr`, +1 tick < `lately = 2`): `slow_addr` was
-    // stamped with `published_now`, so it must NOT be prematurely evicted.
-    let _trigger = exact_with_limits(trigger_addr, 256, 2, 2, make).unwrap();
-    {
-        let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            map.contains_key(&(slow_addr, 256)),
-            "slowly allocated entry must use publish-time tick and survive immediate sweep"
-        );
-        assert!(map.contains_key(&(held_addr, 256)));
-    }
-    drop(held);
+    // Check the published stamp directly. Other tests also advance the shared clock.
+    let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        !map.contains_key(&(idle_addr, 256)),
+        "idle exact entry must be evicted"
+    );
+    let (held_in_cache, _) = map.get(&(held_addr, 256)).expect("held exact entry");
+    assert!(Arc::ptr_eq(&held, held_in_cache));
+    let (slow_in_cache, used) = map.get(&(slow_addr, 256)).expect("fresh exact entry");
+    assert!(Arc::ptr_eq(&slow, slow_in_cache));
+    assert!(
+        used.load(Ordering::Relaxed) >= before_publish,
+        "the slow allocation must use a publish-time tick"
+    );
 }
