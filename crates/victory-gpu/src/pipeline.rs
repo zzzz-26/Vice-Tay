@@ -77,11 +77,39 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+struct CachedShader {
+    shader: Arc<Shader>,
+    #[cfg(windows)]
+    used: std::time::Instant,
+}
+
+impl CachedShader {
+    fn new(stage: &'static str, bytes: &[u8], full: blake3::Hash) -> Self {
+        KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            shader: Arc::new(Shader {
+                stage,
+                hash: full.to_hex()[..16].to_owned(),
+                container: bytes.to_vec(),
+                #[cfg(windows)]
+                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
+                #[cfg(windows)]
+                translated: OnceLock::new(),
+            }),
+            #[cfg(windows)]
+            used: std::time::Instant::now(),
+        }
+    }
+}
+
+/// Interned containers plus a bounded warm cache of shaders no pipeline owns.
+static SHADERS: Mutex<Option<HashMap<[u8; 32], CachedShader>>> = Mutex::new(None);
 
 /// For the memory lines: containers kept and their bytes, translations
-/// kept and the bytes of their host code. None of them is ever let go.
+/// kept and the bytes of their host code. Counts fall when a shader is evicted.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
@@ -107,25 +135,71 @@ pub(crate) fn kept() -> [u64; 7] {
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
+    let cached = shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
-        .or_insert_with(|| {
-            KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
-                #[cfg(windows)]
-                probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-            })
-        })
-        .clone()
+        .or_insert_with(|| CachedShader::new(stage, bytes, full));
+    #[cfg(windows)]
+    {
+        cached.used = std::time::Instant::now();
+    }
+    cached.shader.clone()
+}
+
+impl Drop for Shader {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        KEPT[0].fetch_sub(1, Relaxed);
+        KEPT[1].fetch_sub(self.container.len() as u64, Relaxed);
+        #[cfg(windows)]
+        if let Some(Some(t)) = self.translated.get() {
+            KEPT[2].fetch_sub(1, Relaxed);
+            KEPT[3].fetch_sub(t.host.dxil.len() as u64, Relaxed);
+        }
+    }
+}
+
+/// Eviction cannot invalidate a pipeline's borrowed translation: any live
+/// owner pins its Arc. Recreated shaders use the existing on-disk code cache.
+#[cfg(windows)]
+fn trim_shader_entries(
+    shaders: &mut HashMap<[u8; 32], CachedShader>,
+    now: std::time::Instant,
+    pressure: bool,
+    budget: usize,
+) -> Vec<Arc<Shader>> {
+    let mut candidates = Vec::new();
+    let mut bytes = 0usize;
+    for (&key, cached) in shaders.iter_mut() {
+        if Arc::strong_count(&cached.shader) != 1 {
+            // Keep recently live shaders warm even if their pipeline is
+            // destroyed just after this sweep.
+            cached.used = now;
+            continue;
+        }
+        let size = cached.shader.container.len()
+            + cached.shader.translated.get().and_then(Option::as_ref).map_or(0, |t| t.host.dxil.len());
+        bytes = bytes.saturating_add(size);
+        candidates.push((cached.used, key, size));
+    }
+    if bytes <= budget {
+        return Vec::new();
+    }
+    candidates.sort_unstable_by_key(|&(used, _, _)| used);
+    let mut gone = Vec::new();
+    for (used, key, size) in candidates {
+        if bytes <= budget || gone.len() == 256 {
+            break;
+        }
+        if !crate::residency::cache_expired(now.saturating_duration_since(used), pressure) {
+            continue;
+        }
+        if let Some(cached) = shaders.remove(&key) {
+            bytes = bytes.saturating_sub(size);
+            gone.push(cached.shader);
+        }
+    }
+    gone
 }
 
 /// A translated shader and the console resources its code reads.
@@ -852,6 +926,13 @@ mod make;
 #[cfg(windows)]
 pub(crate) fn trim_library() {
     library::trim();
+    let pressure = crate::residency::pressured();
+    let budget = if pressure { 32 << 20 } else { 128 << 20 };
+    let gone = SHADERS.try_lock().ok().and_then(|mut shaders| {
+        shaders.as_mut().map(|shaders| trim_shader_entries(shaders, std::time::Instant::now(), pressure, budget))
+    });
+    // Dropping large bytecode containers must not hold the interning lock.
+    drop(gone);
 }
 
 /// The pipeline library's part of the report when the host device is
@@ -877,6 +958,36 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn shader_eviction_preserves_live_owners_and_recent_cache_hits() {
+        use super::*;
+        let mut cache = HashMap::new();
+        let now = std::time::Instant::now();
+        let mut weak = Vec::new();
+        for byte in 0..3u8 {
+            let bytes = [byte; 16];
+            let full = blake3::hash(&bytes);
+            let mut entry = CachedShader::new("vertex", &bytes, full);
+            entry.used = now;
+            weak.push(Arc::downgrade(&entry.shader));
+            cache.insert(*full.as_bytes(), entry);
+        }
+        let live = weak[0].upgrade().unwrap();
+        let later = now + std::time::Duration::from_secs(3);
+        // A recently looked-up shader gets the same grace as a live shader.
+        cache.get_mut(blake3::hash(&[1; 16]).as_bytes()).unwrap().used = later;
+        drop(trim_shader_entries(&mut cache, later, true, 0));
+        assert!(weak[0].upgrade().is_some());
+        assert!(weak[1].upgrade().is_some());
+        assert!(weak[2].upgrade().is_none());
+        drop(live);
+        drop(trim_shader_entries(&mut cache, later, true, 0));
+        assert_eq!(cache.len(), 2);
+        drop(trim_shader_entries(&mut cache, later + std::time::Duration::from_secs(3), true, 0));
+        assert!(cache.is_empty());
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn indirect_prepare_examples_preserve_each_command_kind() {

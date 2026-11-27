@@ -551,6 +551,7 @@ fn sweep() {
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::list::trim_idle();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();

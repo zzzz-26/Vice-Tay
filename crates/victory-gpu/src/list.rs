@@ -225,7 +225,7 @@ pub(crate) fn ran(lists: &mut [Detached]) {
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, std::time::Instant);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -266,13 +266,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -299,10 +299,36 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, std::time::Instant::now()));
             idle.1 += bytes;
         }
     }
+}
+
+/// Release cold, completed host lists, including their allocator storage
+/// and indirect buffers (neither is included in `scratch_kept`). Never trim
+/// recent bursts just to meet a smaller count: that caused allocator churn.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let pressure = crate::residency::pressured();
+    let mut gone = Vec::new();
+    if let Ok(mut idle) = IDLE.try_lock() {
+        let now = std::time::Instant::now();
+        let mut i = 0;
+        // Bound driver destruction per sweep, retaining a small warm floor.
+        while i < idle.0.len() && idle.0.len() > 32 && gone.len() < 32 {
+            if crate::residency::cache_expired(now.saturating_duration_since(idle.0[i].2), pressure) {
+                let entry = idle.0.swap_remove(i);
+                idle.1 -= entry.1;
+                gone.push(entry);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    // D3D12 destruction may enter the driver. No cache lock is held here.
+    drop(gone);
+    thin::trim_idle();
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut

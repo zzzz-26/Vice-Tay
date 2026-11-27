@@ -109,3 +109,45 @@ the preset, a longer acceleration toward the shore averaged 17.60 FPS over
 33.06 seconds and one interval dropped to 3.51 FPS. The boats reached different
 positions during the longer run. Sustained 20 FPS through shoreline streaming
 and longer-session behavior still need validation.
+
+
+## Memory retention changes (2026-11-26)
+
+The memory-pressure pass changes cache ownership and reclamation, not shader
+translation, resolution, resource visibility or GPU completion rules:
+
+- The optional loose-window budget counts all unique copies, including pinned
+  copies. Only idle copies with no external owner or descriptor references can
+  be removed; aliases in the table are removed together.
+- Snapshot returns obey the same 32 MiB pressure budget as the sweep, instead
+  of refilling the 512 MiB normal cache between sweeps.
+- Completed host-list and thin-front pools release entries idle for two seconds
+  under pressure, or 30 seconds otherwise. Each pool keeps a floor of 32 and
+  releases at most 32 entries per sweep. The thin-front pool is capped at 512.
+  Recent submission bursts retain their reuse capacity.
+- The recorded-word pool budgets allocated capacity: 128 MiB normally, 16 MiB
+  under pressure, still allowing 1,024 ordinary small chunks. Destruction occurs
+  outside its lock.
+- Per-thread texture read buffers over 1 MiB can be reclaimed after the same
+  grace period, including on idle workers. A locked, currently used buffer is
+  skipped. Small reads no longer keep an old, much larger allocation alive.
+- Shader interning retains live pipeline owners. Unowned containers and DXIL
+  have a soft cache budget of 128 MiB normally or 32 MiB under pressure, with
+  age-based eviction limited to 256 entries per sweep. Shader memory counters
+  decrease on destruction. Reloads use the existing translation disk cache
+  when configured; no cache format or translator version changes.
+- New speculative staging blocks require at least 1 GiB of physical RAM as
+  well as commit headroom. Required uploads, existing staging slices and
+  one-shot material bakes retain their existing admission rules.
+
+These are retention limits, not limits on live game resources. In-flight work
+and resources still referenced by the game can exceed them. Driver allocator
+storage is not fully exposed by D3D12, so idle-list trimming uses age and count.
+Cache eviction can add work when a cold resource is needed again.
+
+Performance remains to be measured in gameplay. Compare the same console,
+scene and camera on the baseline and patched builds after streaming settles,
+then revisit an earlier area to check cache-miss stutter. Record working set,
+private commit, hard faults, local/shared GPU memory, frame preparation and
+copy-back times, and shader disk-cache hits/misses. Reduced RAM usage alone
+does not establish a frame-rate improvement.

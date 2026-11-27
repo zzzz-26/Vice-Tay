@@ -135,7 +135,7 @@ impl Front {
         if self.words.is_empty() {
             return;
         }
-        let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+        let fresh = held(&WORDS).take().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
         let words = std::mem::replace(&mut self.words, fresh);
         CHUNKS.fetch_add(1, Relaxed);
         let schedule = {
@@ -160,12 +160,58 @@ impl Front {
 }
 
 /// Streams' memory to use again.
-static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
+static WORDS: Mutex<WordPool> = Mutex::new(WordPool { buffers: Vec::new(), bytes: 0 });
+
+#[derive(Default)]
+struct WordPool {
+    buffers: Vec<Vec<u64>>,
+    bytes: usize,
+}
+
+impl WordPool {
+    fn take(&mut self) -> Option<Vec<u64>> {
+        let words = self.buffers.pop()?;
+        self.bytes -= words.capacity() * size_of::<u64>();
+        Some(words)
+    }
+
+    fn put(&mut self, mut words: Vec<u64>, budget: usize) -> Option<Vec<u64>> {
+        let bytes = words.capacity() * size_of::<u64>();
+        if self.buffers.len() >= 1024 || words.capacity() > 16 * CHUNK || self.bytes + bytes > budget {
+            return Some(words);
+        }
+        words.clear();
+        self.bytes += bytes;
+        self.buffers.push(words);
+        None
+    }
+
+    fn trim(&mut self, budget: usize) -> Vec<Vec<u64>> {
+        let mut gone = Vec::new();
+        if self.bytes > budget {
+            // Prefer retaining many ordinary chunks over a few huge streams.
+            self.buffers.sort_unstable_by_key(Vec::capacity);
+            while self.bytes > budget {
+                if let Some(words) = self.take() {
+                    gone.push(words);
+                } else {
+                    break;
+                }
+            }
+        }
+        gone
+    }
+}
+
+fn word_budget() -> usize {
+    if crate::residency::pressured() { 16 << 20 } else { 128 << 20 }
+}
 /// Recordings with words to translate.
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
-static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static BACKS: Mutex<Vec<(usize, std::time::Instant)>> = Mutex::new(Vec::new());
+const BACKS_MOST: usize = 512;
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -272,24 +318,35 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let keep = {
+                let mut backs = held(&BACKS);
+                if backs.len() < BACKS_MOST {
+                    backs.push((inner.back, std::time::Instant::now()));
+                    true
+                } else {
+                    false
+                }
+            };
+            if !keep {
+                // The last recording owner is gone. Submitted host work was
+                // detached into the submission; this front is no longer used.
+                super::list_release(inner.back as This);
+            }
         }
     }
 }
 
 fn give_back(streams: Vec<Vec<u64>>) {
+    let budget = word_budget();
     let mut words = held(&WORDS);
-    for mut s in streams {
-        if words.len() < 1024 && s.capacity() <= 16 * CHUNK {
-            s.clear();
-            words.push(s);
-        }
-    }
+    let gone: Vec<_> = streams.into_iter().filter_map(|s| words.put(s, budget)).collect();
+    drop(words);
+    drop(gone);
 }
 
 /// A list of ours, closed.
 fn back_list(kind: u32) -> This {
-    if let Some(back) = held(&BACKS).pop() {
+    if let Some((back, _)) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
@@ -297,6 +354,33 @@ fn back_list(kind: u32) -> This {
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
     list
+}
+
+/// Only closed fronts with no recording owner are in BACKS. Their submitted
+/// host lists have separate lifetimes; they are not touched by this sweep.
+pub(super) fn trim_idle() {
+    let pressure = crate::residency::pressured();
+    let mut gone = Vec::new();
+    if let Ok(mut backs) = BACKS.try_lock() {
+        let now = std::time::Instant::now();
+        let mut i = 0;
+        while i < backs.len() && backs.len() > 32 && gone.len() < 32 {
+            if crate::residency::cache_expired(now.saturating_duration_since(backs[i].1), pressure) {
+                gone.push(backs.swap_remove(i).0);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for back in gone {
+        super::list_release(back as This);
+    }
+    let gone = if pressure {
+        WORDS.try_lock().ok().map(|mut words| words.trim(word_budget()))
+    } else {
+        None
+    };
+    drop(gone);
 }
 
 fn start() {
@@ -858,6 +942,27 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_pool_budgets_bytes_without_discarding_small_reusable_chunks() {
+        let mut pool = WordPool::default();
+        // A pressure budget still fits the original count of ordinary chunks.
+        for _ in 0..1024 {
+            assert!(pool.put(Vec::with_capacity(CHUNK), 16 << 20).is_none());
+        }
+        assert_eq!(pool.bytes, 8 << 20);
+        assert!(pool.put(Vec::with_capacity(CHUNK), 16 << 20).is_some());
+        drop(pool.take());
+        assert_eq!(pool.bytes, (1024 - 1) * CHUNK * size_of::<u64>());
+        drop(pool.trim(0));
+        assert_eq!(pool.bytes, 0);
+        assert!(pool.buffers.is_empty());
+        assert!(pool.put(Vec::with_capacity(16 * CHUNK), 128 << 20).is_none());
+        assert!(pool.put(Vec::with_capacity(CHUNK), 128 << 20).is_none());
+        drop(pool.trim(CHUNK * size_of::<u64>()));
+        assert_eq!(pool.take().unwrap().capacity(), CHUNK);
+        assert_eq!(pool.bytes, 0);
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.
