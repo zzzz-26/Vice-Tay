@@ -447,10 +447,10 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         .collect();
     if !missing.is_empty() {
         println!("{} of {} containers are looked for in the title's files", missing.len(), wanted.len());
-        for root in crate::default_paths(Vec::new())? {
+        'scan: for root in crate::default_paths(Vec::new())? {
             for entry in walkdir::WalkDir::new(root).into_iter().filter_map(std::result::Result::ok) {
                 let size = entry.metadata().map_or(0, |m| m.len());
-                if missing.is_empty() || !entry.file_type().is_file() || size > crate::shader::MAX_FILE {
+                if !entry.file_type().is_file() || size > crate::shader::MAX_FILE {
                     continue;
                 }
                 let Ok(data) = std::fs::read(entry.path()) else { continue };
@@ -459,14 +459,17 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
                     let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
                     if missing.remove(hash.as_str()) {
                         std::fs::write(kept.join(format!("{hash}.cdxil")), &bytes[..])?;
+                        if missing.is_empty() {
+                            break 'scan;
+                        }
                     }
                 }
             }
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    victory_shader::emit::set_host_max_wave(crate::requested_host_wave().unwrap_or(64));
+    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_none_or(|value| value == "1"));
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();

@@ -29,6 +29,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Check the diagnostics profile
+        run: cargo check --workspace --profile diag --all-features --locked
+      - name: Check Linux script syntax
+        shell: bash
+        run: |
+          bash -n linux/play.sh
+          bash -n linux/wineserver/build.sh
+      - name: Check PowerShell script syntax
+        shell: pwsh
+        run: |
+          foreach ($script in Get-ChildItem scripts -Filter *.ps1 -File) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $script.FullName, [ref]$null, [ref]$errors)
+            if ($errors) { throw ($errors -join [Environment]::NewLine) }
+          }
 
   test-default:
     name: Default tests

@@ -300,6 +300,30 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
+#[test]
+fn scalar_min_max_pass_the_comparison_to_conditional_select() {
+    // The expected flags are in signed-min, unsigned-min, signed-max, unsigned-max order.
+    let cases = [
+        ([0, 5, 0, 0], [1, 1, 0, 0]),
+        ([5, 0, 0, 0], [0, 0, 1, 1]),
+        ([7, 7, 0, 0], [0, 0, 0, 0]),
+        ([u32::MAX, 1, 0, 0], [1, 0, 0, 1]),
+        ([1, 0x8000_0000, 0, 0], [0, 1, 1, 0]),
+        ([0x8000_0000, 0, 0, 0], [1, 0, 0, 1]),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for (column, opcode) in (0x06..=0x09).enumerate() {
+        let shader = build_valu_cs(&[
+            sop2(opcode, 2, 0, 1),    // s_min/max s2, s0, s1
+            sop2(0x0a, 3, 129, 128), // s_cselect_b32 s3, 1, 0
+            vop1(1, 0, sgpr(3)),     // v_mov_b32 v0, s3
+        ]);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            assert_eq!(got, cases[i].1[column], "{backend}, opcode {opcode:#x}, case {i}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }

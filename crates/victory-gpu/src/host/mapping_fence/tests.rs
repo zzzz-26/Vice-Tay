@@ -30,7 +30,11 @@ fn event_registration_and_native_failed_wait_are_reported() {
     );
     assert_eq!(err.unwrap_err().code(), E_OUTOFMEMORY);
     // This is a real WAIT_FAILED, not a signalled event (and cannot block).
-    let err = wait_until_complete(|| Ok(false), || Ok(()), || wait_event(HANDLE::default()));
+    let err = wait_until_complete(
+        || Ok(false),
+        || Ok(()),
+        || wait_event(HANDLE::default(), INFINITE),
+    );
     assert_eq!(
         err.unwrap_err().code(),
         windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0)
@@ -71,19 +75,21 @@ fn an_unconfirmed_submission_is_not_reexecuted_and_cannot_cover_new_mappings() {
     let mut progress = Progress::default();
     let trace = RefCell::new(Vec::new());
     let submit = || trace.borrow_mut().push("submit");
-    let failed = |value, recovering| {
+    let failed = |value, attempt| {
         assert_eq!(value, 1);
-        trace
-            .borrow_mut()
-            .push(if recovering { "recover" } else { "check" });
+        trace.borrow_mut().push(if attempt == Attempt::Retry {
+            "recover"
+        } else {
+            "check"
+        });
         Err(Error::from_hresult(E_FAIL))
     };
     assert_eq!(progress.run(submit, failed).unwrap_err().code(), E_FAIL);
     assert_eq!(progress.run(submit, failed).unwrap_err().code(), E_FAIL);
     progress
-        .run(submit, |value, recovering| {
-            assert_eq!(value, if recovering { 1 } else { 2 });
-            trace.borrow_mut().push(if recovering {
+        .run(submit, |value, attempt| {
+            assert_eq!(value, if attempt == Attempt::Retry { 1 } else { 2 });
+            trace.borrow_mut().push(if attempt == Attempt::Retry {
                 "confirmed old"
             } else {
                 "confirmed new"
@@ -102,6 +108,48 @@ fn an_unconfirmed_submission_is_not_reexecuted_and_cannot_cover_new_mappings() {
             "confirmed new"
         ]
     );
+}
+
+#[test]
+fn a_timed_out_mapping_checks_the_old_marker_before_submitting_again() {
+    let mut progress = Progress::default();
+    let submitted = Cell::new(0);
+    let submit = || submitted.set(submitted.get() + 1);
+    let err = progress.run(submit, |value, attempt| {
+        assert_eq!((value, attempt), (1, Attempt::Initial));
+        Err(Error::from_hresult(MAPPING_TIMEOUT))
+    });
+    assert_eq!(err.unwrap_err().code(), MAPPING_TIMEOUT);
+    let err = progress.run(submit, |value, attempt| {
+        assert_eq!((value, attempt), (1, Attempt::AfterTimeout));
+        Err(Error::from_hresult(MAPPING_TIMEOUT))
+    });
+    assert_eq!(err.unwrap_err().code(), MAPPING_TIMEOUT);
+    assert_eq!(submitted.get(), 1);
+
+    progress
+        .run(submit, |value, attempt| {
+            if value == 1 {
+                assert_eq!(attempt, Attempt::AfterTimeout);
+                assert_eq!(submitted.get(), 1);
+            } else {
+                assert_eq!((value, attempt), (2, Attempt::Initial));
+                assert_eq!(submitted.get(), 2);
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn an_unsignalled_native_event_reports_a_timeout() {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::CreateEventW;
+    // SAFETY: this test owns the non-signalled event until the wait finishes.
+    let event = unsafe { CreateEventW(None, false, false, None) }.unwrap();
+    let waited = wait_event(event, 0);
+    unsafe { CloseHandle(event) }.unwrap();
+    assert_eq!(waited.unwrap_err().code(), MAPPING_TIMEOUT);
 }
 
 #[test]

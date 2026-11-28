@@ -1,8 +1,10 @@
 # RTX 4070 performance work
 
 Select `-Machine 4070` for the RTX 4070 / Ryzen 7 7800X3D / 32 GB
-machine. Automatic selection uses the existing vendor profiles. The 4070
-profile keeps the console
+machine. Automatic selection uses the vendor defaults for memory and rendering
+and sizes the NVIDIA list translation, memory update and landing workers to the
+CPU. The explicit 4070 profile adds the measured GPU buffer and window budgets.
+It keeps the console
 selection (Series X by default), output mode, texture mip policy, and the
 four-shader wave64 allowlist unchanged.
 

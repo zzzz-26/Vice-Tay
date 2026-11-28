@@ -1315,6 +1315,12 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            // A pad read over HID takes its rumble over HID too: XInput
+            // does not know it.
+            if let Some(id) = self.hid_slots[slot] {
+                super::dualsense::set_motors(id, low, high);
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,

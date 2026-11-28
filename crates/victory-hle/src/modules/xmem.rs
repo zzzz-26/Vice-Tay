@@ -180,6 +180,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    if !at.is_null() && (placeholder || kind & MEM_RESERVE_PLACEHOLDER != 0) {
+        victory_gpu::title_memory_placeholder(at as usize, size);
+    }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
@@ -342,6 +345,42 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    if size >= PAGE
+        && layout.align() <= PAGE
+        && watch_xmem_alloc()
+        && let Some(total) = size.checked_add(PAGE)
+    {
+        // SAFETY: 64 KiB-aligned write-watched private allocation with a
+        // leading 64 KiB page holding the `[usize::MAX, base]` header.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                total,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        if !base.is_null() {
+            victory_gpu::title_memory_allocated(base as usize, total);
+            // SAFETY: `total >= PAGE + size`, `HEADER <= PAGE`.
+            let user = unsafe {
+                let user = base.add(PAGE);
+                user.sub(HEADER)
+                    .cast::<[usize; 2]>()
+                    .write([usize::MAX, base as usize]);
+                user
+            };
+            if size >= MIB {
+                tracing::info!(
+                    at = format_args!("{user:p}"),
+                    size = format_args!("{size:#x}"),
+                    "XMemAllocDefault watched"
+                );
+            }
+            return user.cast();
+        }
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -384,6 +423,12 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if size == usize::MAX {
+            let _changing = victory_gpu::title_memory_remapping();
+            victory_gpu::title_memory_freed(align, 0);
+            VirtualFree(align as *mut c_void, 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -1992,6 +2037,15 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
             })
             .is_ok();
     moved.into()
+}
+
+/// Whether large (>= 64 KiB) [`XMemAllocDefault`] allocations use
+/// `VirtualAlloc(..., MEM_WRITE_WATCH)` (`VICTORY_WATCH_XMEM_ALLOC=1`; off by
+/// default). Prevents large private GPU buffers (e.g. GTA VI's 21 MB buffer)
+/// from falling back to whole-buffer copies every frame.
+fn watch_xmem_alloc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_XMEM_ALLOC").is_some_and(|v| v == "1"))
 }
 
 /// The title's own `VirtualFree`. What the GPU side noted of the memory goes

@@ -47,8 +47,8 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
 
 use victory_gpu::object::Object;
 use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Resource};
@@ -459,6 +459,10 @@ struct Parameters {
     layout: Layout,
 }
 
+// SAFETY: NGX parameter objects are not thread-affine; exclusive access is
+// enforced by the surrounding `Mutex`.
+unsafe impl Send for Parameters {}
+
 impl Parameters {
     fn method(&self, index: usize) -> *const c_void {
         // SAFETY: a live NGX object, whose table has 17 methods.
@@ -598,7 +602,9 @@ type Capabilities = unsafe extern "C" fn(*mut *mut NgxParameter) -> u32;
 type Create = unsafe extern "C" fn(*mut c_void, u32, *mut NgxParameter, *mut *mut c_void) -> u32;
 type Evaluate = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut NgxParameter, usize) -> u32;
 type Release = unsafe extern "C" fn(*mut c_void) -> u32;
-type Shutdown = unsafe extern "C" fn(*mut c_void) -> u32;
+/// The core's `NVSDK_NGX_D3D12_Shutdown1`: takes the device and an out
+/// pointer for the remaining initialization count (`unsigned int *OutRemaining`).
+type Shutdown = unsafe extern "C" fn(*mut c_void, *mut u32) -> u32;
 type DestroyParameters = unsafe extern "C" fn(*mut NgxParameter) -> u32;
 
 struct Ngx {
@@ -629,6 +635,8 @@ unsafe impl Send for Ngx {}
 unsafe impl Sync for Ngx {}
 
 static NGX: OnceLock<Ngx> = OnceLock::new();
+/// Serializes concurrent shutdown callers and ensures teardown runs once.
+static SHUT_DOWN_ONCE: Once = Once::new();
 /// The shutdown began: nothing is made or evaluated any more.
 static SHUT_DOWN: AtomicBool = AtomicBool::new(false);
 /// `Shutdown1` ran: NGX released what was left, and nothing is released
@@ -647,6 +655,33 @@ struct InitData {
     info: FeatureInfo,
 }
 
+/// Destroys NGX's capability parameters (when obtained and supported by the
+/// core) before calling `NVSDK_NGX_D3D12_Shutdown1` with a valid
+/// `OutRemaining` pointer. Returns `(destroy_result, shutdown_result, remaining)`.
+///
+/// # Safety
+/// `device` is a live `ID3D12Device` NGX was initialized on, `object` is null
+/// or a live parameter object from that initialization, and
+/// `destroy_parameters` / `shutdown` are the core's exports.
+unsafe fn cleanup_start_failure(
+    device: *mut c_void,
+    object: *mut NgxParameter,
+    destroy_parameters: Option<DestroyParameters>,
+    shutdown: Shutdown,
+) -> (Option<u32>, u32, u32) {
+    let destroyed = if !object.is_null() {
+        // SAFETY: `object` is a live NGX parameter object owned by this init.
+        destroy_parameters.map(|destroy| unsafe { destroy(object) })
+    } else {
+        None
+    };
+    let mut remaining = 0u32;
+    // SAFETY: NGX was initialized on `device` and holds no feature;
+    // `&mut remaining` is `Shutdown1`'s `unsigned int *OutRemaining`.
+    let shut = unsafe { shutdown(device, &mut remaining) };
+    (destroyed, shut, remaining)
+}
+
 /// Whether DLSS serves the title's FidelityFX calls.
 pub(super) fn active() -> bool {
     NGX.get().is_some()
@@ -662,6 +697,9 @@ pub(super) fn start(
     quality: i32,
     ffx_quality: Option<u32>,
 ) -> Result<String, String> {
+    if NGX.get().is_some() {
+        return Err("DLSS already initialized".into());
+    }
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
         LoadLibraryExW,
@@ -752,7 +790,7 @@ pub(super) fn start(
             .ok_or_else(|| format!("{} has no {}", core.display(), name.to_string_lossy()))
     };
     // SAFETY: the core's exports, with nvsdk_ngx.h's signatures (`Init`'s
-    // as the core has it).
+    // and `Shutdown`'s as the core has them).
     let (init, capabilities, create, evaluate, release, shutdown) = unsafe {
         (
             std::mem::transmute::<*const c_void, Init>(find(c"NVSDK_NGX_D3D12_Init_ProjectID")?),
@@ -815,22 +853,48 @@ pub(super) fn start(
     if !succeeded(result) {
         return Err(format!("NVSDK_NGX_D3D12_Init_ProjectID failed: {}", result_name(result)));
     }
-    let fail = |message: String| {
-        // SAFETY: NGX was initialized on this device and holds no feature.
-        unsafe { shutdown(device.as_raw()) };
+    let log_cleanup = |destroyed: Option<u32>, shut: u32, remaining: u32| {
+        if let Some(result) = destroyed
+            && !succeeded(result)
+        {
+            tracing::warn!(
+                result = result_name(result),
+                "DLSS: destroying NGX parameters after failed start failed"
+            );
+        }
+        if !succeeded(shut) {
+            tracing::warn!(
+                result = result_name(shut),
+                remaining,
+                "DLSS: shutting NGX down after failed start failed"
+            );
+        }
+    };
+    let fail = |object: *mut NgxParameter, message: String| {
+        // SAFETY: NGX was initialized on this device, holds no feature, and
+        // `object` is null or a live parameter object from this init.
+        let (destroyed, shut, remaining) =
+            unsafe { cleanup_start_failure(device.as_raw(), object, destroy_parameters, shutdown) };
+        log_cleanup(destroyed, shut, remaining);
         Err(message)
     };
     let mut object = null_mut();
     // SAFETY: an out pointer for NGX's capability parameters.
     let result = unsafe { capabilities(&mut object) };
     if !succeeded(result) || object.is_null() {
-        return fail(format!(
-            "NVSDK_NGX_D3D12_GetCapabilityParameters failed: {}",
-            result_name(result)
-        ));
+        return fail(
+            null_mut(),
+            format!(
+                "NVSDK_NGX_D3D12_GetCapabilityParameters failed: {}",
+                result_name(result)
+            ),
+        );
     }
     let Some(layout) = probe(object) else {
-        return fail("NGX's parameter object has a method table of an unknown order".into());
+        return fail(
+            object,
+            "NGX's parameter object has a method table of an unknown order".into(),
+        );
     };
     let parameters = Parameters { object, layout };
     if parameters.get_i32(c"SuperSampling.Available") != Some(1) {
@@ -840,10 +904,13 @@ pub(super) fn start(
         let init = parameters
             .get_i32(c"SuperSampling.FeatureInitResult")
             .map(|r| result_name(r as u32));
-        return fail(format!(
-            "DLSS Super Resolution is unavailable on this GPU (needs a newer driver: {driver:?}, \
-             minimum {major:?}.{minor:?}, feature initialization {init:?})"
-        ));
+        return fail(
+            object,
+            format!(
+                "DLSS Super Resolution is unavailable on this GPU (needs a newer driver: {driver:?}, \
+                 minimum {major:?}.{minor:?}, feature initialization {init:?})"
+            ),
+        );
     }
     let summary = format!(
         "core {}, {}, parameter table {layout:?}, presets {} (quality, balanced, \
@@ -855,7 +922,7 @@ pub(super) fn start(
         if reactive { "in" } else { "left out" },
         if no_update { "off" } else { "NGX's default" },
     );
-    NGX.set(Ngx {
+    if let Err(ngx) = NGX.set(Ngx {
         create,
         evaluate,
         release,
@@ -869,8 +936,24 @@ pub(super) fn start(
         reactive,
         feature_dir,
         device,
-    })
-    .map_err(|_| String::from("DLSS already initialized"))?;
+    }) {
+        let object = std::mem::replace(
+            &mut ngx.parameters.lock().unwrap_or_else(|e| e.into_inner()).object,
+            null_mut(),
+        );
+        // SAFETY: this losing race initialized NGX on `ngx.device` and owns
+        // `object` with no features created on it.
+        let (destroyed, shut, remaining) = unsafe {
+            cleanup_start_failure(
+                ngx.device.as_raw(),
+                object,
+                ngx.destroy_parameters,
+                ngx.shutdown,
+            )
+        };
+        log_cleanup(destroyed, shut, remaining);
+        return Err(String::from("DLSS already initialized"));
+    }
     Ok(summary)
 }
 
@@ -960,35 +1043,61 @@ fn loaded_snippet() -> Option<PathBuf> {
 
 // Locks, always taken in this order: a context's `feature`, NGX's
 // `parameters`, a host list's own state (taken inside `Recording::keep`
-// and when a list is reset), `PENDING`. `PENDING` is held for no call
-// into NGX or anything else, so no order can close a cycle; every NGX
-// call (make, evaluate, release, shut down) is made under `parameters`,
-// so no two overlap.
+// and when a list is reset), leaf locks (`PENDING`, `LIVE_HANDLES`).
+// Neither leaf lock is held for any call into NGX or any other lock, so
+// no order can close a cycle; every NGX call (make, evaluate, release,
+// shut down) is made under `parameters`, so no two overlap.
 
-/// A DLSS feature NGX made. When the last reference goes (the context's,
-/// or that of a host list that recorded it, held until the list is reset
-/// after its last submission ran), the handle waits in [`PENDING`] for the
-/// next release under the parameter lock: the last reference may go on
-/// any thread, inside a list's lock.
-struct Handle(*mut c_void);
+/// A DLSS feature NGX made. Stored in an [`AtomicPtr`] so shutdown can claim
+/// and release a live handle once even while host command lists still hold
+/// cloned `Arc<Handle>` references. When the last reference goes before NGX
+/// shuts down, the handle waits in [`PENDING`] for the next release under the
+/// parameter lock: the last reference may go on any thread, inside a list's
+/// lock.
+struct Handle(AtomicPtr<c_void>);
 
-// SAFETY: NGX's feature handles are not tied to a thread; dropping one
-// only queues it.
-unsafe impl Send for Handle {}
-// SAFETY: as above; a shared handle is only read.
-unsafe impl Sync for Handle {}
+impl Handle {
+    fn new(raw: *mut c_void) -> Self {
+        Self(AtomicPtr::new(raw))
+    }
+
+    fn raw(&self) -> *mut c_void {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn take(&self) -> *mut c_void {
+        self.0.swap(null_mut(), Ordering::AcqRel)
+    }
+
+    fn enqueue_drop(&self, ngx_gone: &AtomicBool, pending: &Mutex<Vec<usize>>) {
+        if self.raw().is_null() || ngx_gone.load(Ordering::Acquire) {
+            return;
+        }
+        let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = self.take();
+        if !raw.is_null() && !ngx_gone.load(Ordering::Acquire) {
+            pending.push(raw as usize);
+        }
+    }
+}
 
 /// Features no one refers to any more, for [`release_pending`].
 static PENDING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// Live features tracked weakly so shutdown can claim and release handles
+/// still retained by retired host lists (e.g. in `bury_lag`) after their
+/// context dropped them.
+static LIVE_HANDLES: Mutex<Vec<Weak<Handle>>> = Mutex::new(Vec::new());
+
+fn track_live_handle(live_handles: &Mutex<Vec<Weak<Handle>>>, handle: &Arc<Handle>) {
+    let mut handles = live_handles.lock().unwrap_or_else(|e| e.into_inner());
+    handles.retain(|weak| weak.strong_count() > 0);
+    handles.push(Arc::downgrade(handle));
+}
+
 impl Drop for Handle {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            PENDING
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(self.0 as usize);
-        }
+        self.enqueue_drop(&NGX_GONE, &PENDING);
     }
 }
 
@@ -996,13 +1105,30 @@ impl Drop for Handle {
 /// lock (`_held`), so a release overlaps no other NGX call; after
 /// `Shutdown1`, NGX has released them itself.
 fn release_pending(ngx: &Ngx, _held: &Parameters) {
-    if NGX_GONE.load(Ordering::Acquire) {
+    // SAFETY: `ngx.release` is `NVSDK_NGX_D3D12_ReleaseFeature` and the caller
+    // holds `ngx.parameters`.
+    unsafe { release_pending_from(&NGX_GONE, &PENDING, ngx.release) };
+}
+
+/// Drains `pending` and releases each feature via `release`, unless `ngx_gone`
+/// is already set.
+///
+/// # Safety
+/// The caller must hold the NGX parameter lock so no other NGX call overlaps,
+/// and every entry in `pending` must be a live NGX feature handle not
+/// referenced by any GPU work still in flight.
+unsafe fn release_pending_from(
+    ngx_gone: &AtomicBool,
+    pending: &Mutex<Vec<usize>>,
+    release: Release,
+) {
+    if ngx_gone.load(Ordering::Acquire) {
         return;
     }
-    let pending = std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()));
+    let pending = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
     for handle in pending {
         // SAFETY: a feature NGX made, released once, in no list left to run.
-        let result = unsafe { (ngx.release)(handle as *mut c_void) };
+        let result = unsafe { release(handle as *mut c_void) };
         if !succeeded(result) {
             tracing::warn!(result = result_name(result), "DLSS: releasing a feature failed");
         }
@@ -1197,58 +1323,169 @@ pub(super) fn destroy_context(context: *mut *mut c_void) -> u32 {
     OK
 }
 
-/// Whether process exit also calls the NGX device shutdown.
-/// Set VICTORY_DLSS_SHUTDOWN=1 to request full SDK shutdown.
-fn calls_shutdown1() -> bool {
-    std::env::var("VICTORY_DLSS_SHUTDOWN").is_ok_and(|v| v == "1")
+struct TeardownState<'a> {
+    once: &'a Once,
+    shut_down: &'a AtomicBool,
+    ngx_gone: &'a AtomicBool,
+    contexts: &'a Mutex<BTreeMap<usize, Arc<Context>>>,
+    live_handles: &'a Mutex<Vec<Weak<Handle>>>,
+    pending: &'a Mutex<Vec<usize>>,
+    parameters: &'a Mutex<Parameters>,
 }
 
-/// Ends DLSS once nothing evaluates any more and the GPU has run what was
-/// submitted: the features lists let go of while it waits are released,
-/// then NGX's capability parameters; `Shutdown1` only when
-/// [`calls_shutdown1`]. Later calls do nothing. (A list recorded before and
-/// never submitted is not run before the process ends.)
+struct TeardownOps {
+    device: *mut c_void,
+    release: Release,
+    destroy_parameters: Option<DestroyParameters>,
+    shutdown: Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TeardownOutcome {
+    result: u32,
+    remaining: u32,
+}
+
+/// Runs NGX teardown once while blocking concurrent callers until it finishes,
+/// preserving the `ctx.feature` -> `parameters` -> leaf lock (`LIVE_HANDLES`,
+/// `PENDING`) order.
+///
+/// # Safety
+/// `ops` must name the live device and core exports corresponding to `state`,
+/// and `finish_submitted` must wait until all submitted GPU work using NGX
+/// features has completed.
+unsafe fn shut_down_with(
+    state: &TeardownState<'_>,
+    ops: TeardownOps,
+    finish_submitted: impl FnOnce(),
+) -> Option<TeardownOutcome> {
+    let mut outcome = None;
+    state.once.call_once(|| {
+        // Under the lock every evaluation holds and checks `shut_down` under:
+        // none is under way, and none starts after.
+        {
+            let _evaluations = state.parameters.lock().unwrap_or_else(|e| e.into_inner());
+            state.shut_down.store(true, Ordering::Release);
+        }
+        tracing::info!("DLSS: waiting for submitted work before NGX shutdown");
+        finish_submitted();
+        // Snapshot active contexts without holding `CONTEXTS` while locking
+        // each `ctx.feature`, then claim any live DLSS feature handles
+        // atomically so later drops of cloned `Arc<Handle>` in host lists
+        // cannot double-release.
+        let contexts: Vec<Arc<Context>> = state
+            .contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut live_handles: Vec<*mut c_void> = Vec::new();
+        for ctx in contexts {
+            let mut feature = ctx.feature.lock().unwrap_or_else(|e| e.into_inner());
+            if feature.mode == Mode::Dlss {
+                feature.live = false;
+                if let Some(handle) = feature.handle.take() {
+                    let raw = handle.take();
+                    if !raw.is_null() {
+                        live_handles.push(raw);
+                    }
+                }
+            }
+        }
+        let mut parameters = state.parameters.lock().unwrap_or_else(|e| e.into_inner());
+        tracing::info!("DLSS: draining pending NGX features");
+        // Claim any detached live feature handles still referenced outside
+        // `CONTEXTS` (for example by host lists retained in `bury_lag` after
+        // `destroy_context`, resize, or FSR fallback) before draining `PENDING`
+        // so a handle mid-drop cannot slip past both.
+        let tracked = std::mem::take(
+            &mut *state.live_handles.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        for weak in tracked {
+            if let Some(handle) = weak.upgrade() {
+                let raw = handle.take();
+                if !raw.is_null() {
+                    live_handles.push(raw);
+                }
+            }
+        }
+        // SAFETY: we hold `state.parameters` and GPU work finished above.
+        unsafe { release_pending_from(state.ngx_gone, state.pending, ops.release) };
+        for handle in live_handles {
+            // SAFETY: claimed once via `Handle::take` after GPU work finished;
+            // remaining `Arc<Handle>` clones now hold null and will not queue it.
+            let result = unsafe { (ops.release)(handle) };
+            if !succeeded(result) {
+                tracing::warn!(
+                    result = result_name(result),
+                    "DLSS: releasing a live feature during shutdown failed"
+                );
+            }
+        }
+        let object = std::mem::replace(&mut parameters.object, null_mut());
+        if !object.is_null()
+            && let Some(destroy) = ops.destroy_parameters
+        {
+            tracing::info!("DLSS: releasing NGX capability parameters");
+            // SAFETY: `object` is NGX's capability parameter object, taken once
+            // under `state.parameters` after all features have been released.
+            let result = unsafe { destroy(object) };
+            if !succeeded(result) {
+                tracing::warn!(
+                    result = result_name(result),
+                    "DLSS: destroying NGX parameters during shutdown failed"
+                );
+            }
+        }
+        tracing::info!("DLSS: calling NGX Shutdown1");
+        let mut remaining = 0u32;
+        // SAFETY: NGX was started on `ops.device`; `&mut remaining` is
+        // `Shutdown1`'s `unsigned int *OutRemaining` out parameter.
+        let result = unsafe { (ops.shutdown)(ops.device, &mut remaining) };
+        state.ngx_gone.store(true, Ordering::Release);
+        state.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drop(parameters);
+        outcome = Some(TeardownOutcome { result, remaining });
+    });
+    outcome
+}
+
+/// Shuts NGX down once nothing evaluates any more and the GPU has run what was
+/// submitted: pending features and live features (both active contexts and
+/// detached handles still retained by retired host lists) are released first,
+/// then the capability parameter object is destroyed, and finally `Shutdown1`
+/// runs. Concurrent callers wait until teardown completes; later calls do
+/// nothing.
 pub(super) fn shut_down() {
     let Some(ngx) = NGX.get() else { return };
-    {
-        // Under the lock every evaluation holds and checks the flag under:
-        // none is under way, and none starts after.
-        let _evaluations = ngx.parameters.lock().unwrap_or_else(|e| e.into_inner());
-        if SHUT_DOWN.swap(true, Ordering::AcqRel) {
-            return;
-        }
-    }
-    tracing::info!("DLSS: waiting for submitted work before NGX shutdown");
-    victory_gpu::external::finish_submitted();
-    let parameters = ngx.parameters.lock().unwrap_or_else(|e| e.into_inner());
-    tracing::info!("DLSS: draining pending NGX features");
-    release_pending(ngx, &parameters);
-    // Live features (a context the title never released) stay NGX's: with
-    // `Shutdown1` it frees them, without it the process does.
-    let destroyed = ngx.destroy_parameters.map(|destroy| {
-        // SAFETY: the object GetCapabilityParameters gave, destroyed once,
-        // under the lock every NGX call holds; nothing reads it after
-        // SHUT_DOWN.
-        unsafe { destroy(parameters.object) }
-    });
-    if let Some(result) = destroyed.filter(|&r| !succeeded(r)) {
-        tracing::warn!(result = result_name(result), "DLSS: destroying NGX's parameters failed");
-    }
-    if !calls_shutdown1() {
-        NGX_GONE.store(true, Ordering::Release);
-        drop(parameters);
-        tracing::info!(
-            "DLSS: features released; NGX's core is left to the process exit \
-             (VICTORY_DLSS_SHUTDOWN=1 calls Shutdown1)"
-        );
+    let state = TeardownState {
+        once: &SHUT_DOWN_ONCE,
+        shut_down: &SHUT_DOWN,
+        ngx_gone: &NGX_GONE,
+        contexts: &CONTEXTS,
+        live_handles: &LIVE_HANDLES,
+        pending: &PENDING,
+        parameters: &ngx.parameters,
+    };
+    let ops = TeardownOps {
+        device: ngx.device.as_raw(),
+        release: ngx.release,
+        destroy_parameters: ngx.destroy_parameters,
+        shutdown: ngx.shutdown,
+    };
+    // SAFETY: `ngx` holds the live host device and core exports; `finish_submitted`
+    // waits for all submitted GPU work before features are released.
+    let Some(outcome) = (unsafe {
+        shut_down_with(&state, ops, victory_gpu::external::finish_submitted)
+    }) else {
         return;
-    }
-    tracing::info!("DLSS: calling NGX's Shutdown1 (VICTORY_DLSS_SHUTDOWN=1)");
-    // SAFETY: NGX was started on this device; nothing of it is used after.
-    let result = unsafe { (ngx.shutdown)(ngx.device.as_raw()) };
-    NGX_GONE.store(true, Ordering::Release);
-    drop(parameters);
-    tracing::info!(result = result_name(result), "DLSS: NGX shut down");
+    };
+    tracing::info!(
+        result = result_name(outcome.result),
+        remaining = outcome.remaining,
+        "DLSS: NGX shut down"
+    );
 }
 
 #[repr(C)]
@@ -1720,7 +1957,9 @@ fn evaluate(
                 ctx.upscale.max_render,
             )));
         }
-        feature.handle = Some(Arc::new(Handle(handle)));
+        let shared = Arc::new(Handle::new(handle));
+        track_live_handle(&LIVE_HANDLES, &shared);
+        feature.handle = Some(shared);
         feature.output = output_size;
         let memory = parameters.video_memory();
         if let Some(bytes) = memory {
@@ -1748,7 +1987,10 @@ fn evaluate(
     let Some(shared) = feature.handle.clone() else {
         return Err(DispatchError::Refused(PARAMETER, "no feature"));
     };
-    let handle = shared.0;
+    let handle = shared.raw();
+    if handle.is_null() {
+        return Err(DispatchError::Refused(PARAMETER, "no feature"));
+    }
     // The list holds the feature until it has run, whatever becomes of the
     // context (a new feature, a fallback, its destruction).
     list.keep(shared);
@@ -2254,5 +2496,417 @@ mod tests {
         assert_eq!(result_name(0xbad0_0005), "InvalidParameter (0xbad00005)");
         assert_eq!(result_name(0xbad0_0001), "FeatureNotSupported (0xbad00001)");
         assert_eq!(result_name(1), "Success");
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum MockCall {
+        Release(usize),
+        DestroyParameters(usize),
+        Shutdown { device: usize, out_non_null: bool },
+    }
+
+    static MOCK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static MOCK_CALLS: Mutex<Vec<MockCall>> = Mutex::new(Vec::new());
+    static MOCK_OUT_REMAINING: AtomicU32 = AtomicU32::new(0);
+
+    fn reset_mock(remaining: u32) {
+        MOCK_CALLS.lock().unwrap().clear();
+        MOCK_OUT_REMAINING.store(remaining, Ordering::Relaxed);
+    }
+
+    fn take_mock_calls() -> Vec<MockCall> {
+        std::mem::take(&mut *MOCK_CALLS.lock().unwrap())
+    }
+
+    unsafe extern "C" fn mock_release(handle: *mut c_void) -> u32 {
+        MOCK_CALLS
+            .lock()
+            .unwrap()
+            .push(MockCall::Release(handle as usize));
+        1
+    }
+
+    unsafe extern "C" fn mock_destroy_parameters(params: *mut NgxParameter) -> u32 {
+        MOCK_CALLS
+            .lock()
+            .unwrap()
+            .push(MockCall::DestroyParameters(params as usize));
+        1
+    }
+
+    unsafe extern "C" fn mock_shutdown(device: *mut c_void, out_remaining: *mut u32) -> u32 {
+        let out_non_null = !out_remaining.is_null();
+        if out_non_null {
+            // SAFETY: tests verify both cleanup paths supply a valid writable
+            // `unsigned int *OutRemaining` storage slot matching `_nvngx.dll`.
+            unsafe { *out_remaining = MOCK_OUT_REMAINING.load(Ordering::Relaxed) };
+        }
+        MOCK_CALLS.lock().unwrap().push(MockCall::Shutdown {
+            device: device as usize,
+            out_non_null,
+        });
+        1
+    }
+
+    fn mock_context(mode: Mode, handle: Option<Arc<Handle>>) -> Arc<Context> {
+        Arc::new(Context {
+            upscale: CreateUpscale {
+                header: Header {
+                    kind: CREATE_UPSCALE,
+                    next: null_mut(),
+                },
+                flags: 0,
+                max_render: [1920, 1080],
+                max_output: [3840, 2160],
+                message: 0,
+            },
+            version: None,
+            feature: Mutex::new(Feature {
+                handle,
+                output: [3840, 2160],
+                mode,
+                live: true,
+            }),
+            frames: AtomicU64::new(0),
+            refusals: AtomicU32::new(0),
+        })
+    }
+
+    struct TeardownFixture {
+        once: Once,
+        shut_down: AtomicBool,
+        ngx_gone: AtomicBool,
+        contexts: Mutex<BTreeMap<usize, Arc<Context>>>,
+        live_handles: Mutex<Vec<Weak<Handle>>>,
+        pending: Mutex<Vec<usize>>,
+        parameters: Mutex<Parameters>,
+    }
+
+    impl TeardownFixture {
+        fn new(object: *mut NgxParameter) -> Self {
+            Self {
+                once: Once::new(),
+                shut_down: AtomicBool::new(false),
+                ngx_gone: AtomicBool::new(false),
+                contexts: Mutex::new(BTreeMap::new()),
+                live_handles: Mutex::new(Vec::new()),
+                pending: Mutex::new(Vec::new()),
+                parameters: Mutex::new(Parameters {
+                    object,
+                    layout: Layout::Msvc,
+                }),
+            }
+        }
+
+        fn state(&self) -> TeardownState<'_> {
+            TeardownState {
+                once: &self.once,
+                shut_down: &self.shut_down,
+                ngx_gone: &self.ngx_gone,
+                contexts: &self.contexts,
+                live_handles: &self.live_handles,
+                pending: &self.pending,
+                parameters: &self.parameters,
+            }
+        }
+
+        fn ops(device: usize) -> TeardownOps {
+            TeardownOps {
+                device: device as *mut c_void,
+                release: mock_release,
+                destroy_parameters: Some(mock_destroy_parameters),
+                shutdown: mock_shutdown,
+            }
+        }
+    }
+
+    #[test]
+    fn teardown_calls_release_then_destroy_parameters_then_shutdown1_in_order() {
+        let _guard = MOCK_TEST_LOCK.lock().unwrap();
+        reset_mock(3);
+
+        let fixture = TeardownFixture::new(0xDEAD_BEEF as *mut NgxParameter);
+        fixture.pending.lock().unwrap().push(0xAAAA);
+        let live_handle = Arc::new(Handle::new(0xCCCC as *mut c_void));
+        track_live_handle(&fixture.live_handles, &live_handle);
+        // Simulate a host command list keeping a clone of the feature handle
+        // alive across shutdown.
+        let retained_by_list = Arc::clone(&live_handle);
+        let dlss_ctx = mock_context(Mode::Dlss, Some(live_handle));
+        let fsr_ctx = mock_context(Mode::Fsr(0xF5E0), None);
+        {
+            let mut contexts = fixture.contexts.lock().unwrap();
+            contexts.insert(1, Arc::clone(&dlss_ctx));
+            contexts.insert(2, Arc::clone(&fsr_ctx));
+        }
+
+        // Simulate a submitted list retiring during `finish_submitted` and
+        // queueing an earlier replaced feature handle before NGX shuts down.
+        let submitted_list_handle = Handle::new(0xBBBB as *mut c_void);
+        // SAFETY: mock C callbacks record calls without dereferencing opaque tokens.
+        let outcome = unsafe {
+            shut_down_with(&fixture.state(), TeardownFixture::ops(0xCAFE), || {
+                submitted_list_handle.enqueue_drop(&fixture.ngx_gone, &fixture.pending);
+            })
+        };
+        assert_eq!(
+            outcome,
+            Some(TeardownOutcome {
+                result: 1,
+                remaining: 3,
+            })
+        );
+        assert_eq!(
+            take_mock_calls(),
+            [
+                MockCall::Release(0xAAAA),
+                MockCall::Release(0xBBBB),
+                MockCall::Release(0xCCCC),
+                MockCall::DestroyParameters(0xDEAD_BEEF),
+                MockCall::Shutdown {
+                    device: 0xCAFE,
+                    out_non_null: true,
+                },
+            ]
+        );
+        {
+            let feature = dlss_ctx.feature.lock().unwrap();
+            assert!(!feature.live);
+            assert!(feature.handle.is_none());
+        }
+        // Already-handed-off FSR contexts must not be clobbered by DLSS teardown.
+        assert!(fsr_ctx.feature.lock().unwrap().live);
+        assert!(fixture.parameters.lock().unwrap().object.is_null());
+        assert!(fixture.shut_down.load(Ordering::Acquire));
+        assert!(fixture.ngx_gone.load(Ordering::Acquire));
+
+        // Dropping the cloned `Arc<Handle>` still held by a host list must NOT
+        // queue or release `0xCCCC` a second time.
+        let global_pending_before = PENDING.lock().unwrap().len();
+        drop(retained_by_list);
+        assert_eq!(PENDING.lock().unwrap().len(), global_pending_before);
+        assert!(fixture.pending.lock().unwrap().is_empty());
+        assert!(take_mock_calls().is_empty());
+
+        // Any other handle dropped after `ngx_gone` is set must also be ignored.
+        let late_handle = Handle::new(0xDDDD as *mut c_void);
+        late_handle.enqueue_drop(&fixture.ngx_gone, &fixture.pending);
+        assert!(fixture.pending.lock().unwrap().is_empty());
+        // Fast-path returns without taking; disarm before drop so global `PENDING` stays clean.
+        assert_eq!(late_handle.take(), 0xDDDD as *mut c_void);
+    }
+
+    #[test]
+    fn teardown_releases_detached_bury_lag_handles_without_double_release() {
+        let _guard = MOCK_TEST_LOCK.lock().unwrap();
+        reset_mock(0);
+
+        let fixture = TeardownFixture::new(0xDEAD_BEEF as *mut NgxParameter);
+        // Push a dead weak entry first to verify `track_live_handle` prunes dead entries.
+        let dead = Arc::new(Handle::new(0x1111 as *mut c_void));
+        track_live_handle(&fixture.live_handles, &dead);
+        assert_eq!(dead.take(), 0x1111 as *mut c_void);
+        drop(dead);
+
+        // Simulate a feature dropped from `ctx.feature` on `destroy_context`,
+        // resize, or FSR fallback whose `Arc<Handle>` is still retained by a
+        // retired `HostList` inside `bury_lag`: not in `CONTEXTS` and not yet
+        // dropped into `PENDING`.
+        let detached = Arc::new(Handle::new(0xD00D as *mut c_void));
+        track_live_handle(&fixture.live_handles, &detached);
+        assert_eq!(fixture.live_handles.lock().unwrap().len(), 1);
+
+        // SAFETY: mock C callbacks record calls without dereferencing opaque tokens.
+        let outcome = unsafe { shut_down_with(&fixture.state(), TeardownFixture::ops(0xBEEF), || {}) };
+        assert_eq!(
+            outcome,
+            Some(TeardownOutcome {
+                result: 1,
+                remaining: 0,
+            })
+        );
+        assert_eq!(
+            take_mock_calls(),
+            [
+                MockCall::Release(0xD00D),
+                MockCall::DestroyParameters(0xDEAD_BEEF),
+                MockCall::Shutdown {
+                    device: 0xBEEF,
+                    out_non_null: true,
+                },
+            ]
+        );
+        assert!(detached.raw().is_null());
+        assert!(fixture.live_handles.lock().unwrap().is_empty());
+
+        // Dropping the detached `Arc<Handle>` afterward must NOT queue or double-release.
+        let global_pending_before = PENDING.lock().unwrap().len();
+        drop(detached);
+        assert_eq!(PENDING.lock().unwrap().len(), global_pending_before);
+        assert!(fixture.pending.lock().unwrap().is_empty());
+        assert!(take_mock_calls().is_empty());
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_and_serializes_concurrent_callers() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let _guard = MOCK_TEST_LOCK.lock().unwrap();
+        reset_mock(0);
+
+        let fixture = TeardownFixture::new(0x6666 as *mut NgxParameter);
+        let handle = Arc::new(Handle::new(0x5555 as *mut c_void));
+        track_live_handle(&fixture.live_handles, &handle);
+        fixture
+            .contexts
+            .lock()
+            .unwrap()
+            .insert(1, mock_context(Mode::Dlss, Some(handle)));
+        let state = fixture.state();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+
+        let state_ref = &state;
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                // SAFETY: mock C callbacks do not dereference opaque tokens.
+                unsafe {
+                    shut_down_with(state_ref, TeardownFixture::ops(0x7777), || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                }
+            });
+
+            // Wait until the first thread has started teardown and is paused in
+            // `finish_submitted`.
+            entered_rx.recv().unwrap();
+            assert!(fixture.shut_down.load(Ordering::Acquire));
+            assert!(!fixture.ngx_gone.load(Ordering::Acquire));
+
+            let second = scope.spawn(move || {
+                // SAFETY: mock C callbacks do not dereference opaque tokens.
+                let outcome =
+                    unsafe { shut_down_with(state_ref, TeardownFixture::ops(0x7777), || {}) };
+                second_done_tx.send(()).unwrap();
+                outcome
+            });
+
+            // The second caller must remain blocked until the first finishes.
+            assert_eq!(
+                second_done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(RecvTimeoutError::Timeout)
+            );
+
+            // Allow the first caller to finish teardown.
+            release_tx.send(()).unwrap();
+            second_done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            assert_eq!(
+                first.join().unwrap(),
+                Some(TeardownOutcome {
+                    result: 1,
+                    remaining: 0,
+                })
+            );
+            assert_eq!(second.join().unwrap(), None);
+        });
+
+        // A third call after completion is also an idempotent no-op.
+        // SAFETY: mock C callbacks do not dereference opaque tokens.
+        assert_eq!(
+            unsafe { shut_down_with(&state, TeardownFixture::ops(0x7777), || {}) },
+            None
+        );
+        assert!(fixture.ngx_gone.load(Ordering::Acquire));
+        assert_eq!(
+            take_mock_calls(),
+            [
+                MockCall::Release(0x5555),
+                MockCall::DestroyParameters(0x6666),
+                MockCall::Shutdown {
+                    device: 0x7777,
+                    out_non_null: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn start_failure_destroys_parameters_before_shutdown1() {
+        let _guard = MOCK_TEST_LOCK.lock().unwrap();
+
+        // Non-null parameter object with `DestroyParameters` present.
+        reset_mock(0);
+        // SAFETY: mock C callbacks record call order without dereferencing tokens.
+        let (destroyed, shut, remaining) = unsafe {
+            cleanup_start_failure(
+                0x3000 as *mut c_void,
+                0x4000 as *mut NgxParameter,
+                Some(mock_destroy_parameters),
+                mock_shutdown,
+            )
+        };
+        assert_eq!(destroyed, Some(1));
+        assert_eq!(shut, 1);
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            take_mock_calls(),
+            [
+                MockCall::DestroyParameters(0x4000),
+                MockCall::Shutdown {
+                    device: 0x3000,
+                    out_non_null: true,
+                },
+            ]
+        );
+
+        // Optional `DestroyParameters` absent: still calls `Shutdown1` cleanly.
+        reset_mock(1);
+        // SAFETY: mock C callback records call order without dereferencing tokens.
+        let (destroyed, shut, remaining) = unsafe {
+            cleanup_start_failure(
+                0x3000 as *mut c_void,
+                0x4000 as *mut NgxParameter,
+                None,
+                mock_shutdown,
+            )
+        };
+        assert_eq!(destroyed, None);
+        assert_eq!(shut, 1);
+        assert_eq!(remaining, 1);
+        assert_eq!(
+            take_mock_calls(),
+            [MockCall::Shutdown {
+                device: 0x3000,
+                out_non_null: true,
+            }]
+        );
+
+        // Null parameter object: skips `DestroyParameters`, still passes a valid
+        // `OutRemaining` pointer to `Shutdown1`.
+        reset_mock(7);
+        // SAFETY: mock C callbacks record call order without dereferencing tokens.
+        let (destroyed, shut, remaining) = unsafe {
+            cleanup_start_failure(
+                0x3000 as *mut c_void,
+                null_mut(),
+                Some(mock_destroy_parameters),
+                mock_shutdown,
+            )
+        };
+        assert_eq!(destroyed, None);
+        assert_eq!(shut, 1);
+        assert_eq!(remaining, 7);
+        assert_eq!(
+            take_mock_calls(),
+            [MockCall::Shutdown {
+                device: 0x3000,
+                out_non_null: true,
+            }]
+        );
     }
 }

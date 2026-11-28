@@ -1,23 +1,46 @@
 # Vice-Tay
 
+> [!IMPORTANT]
+> **Development Paused Until Monday, November 30 (AI Usage Limit Reached)**
+>
+> Active development on Vice-Tay is taking a brief pit stop until **Monday, November 30**: the AI copilot behind our workflow has reached its usage limit for the current cycle, and we are waiting for the quota to recharge before jumping back into the codebase.
+>
+> **Nothing is expected or required.** Development will resume as soon as the limit is available again. If you would like to **optionally** help accelerate development and get us back to work earlier, voluntary donations go directly toward extra AI credits so we can return ahead of schedule; otherwise, the project will stay paused until Monday.
+>
+> **Ethereum (USDC):** `0x813E922837A7508d9A6838F171C63463f31A4717`
+
 **Xbox Series compatibility on Windows, tuned on a GeForce RTX 4090.**
 
 Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox Series title from your own files. The title's x86-64 code runs on the host CPU. The compatibility layer provides the console APIs it calls and translates its graphics work to Direct3D 12.
 
-[Quick start](#getting-started) · [Gameplay](#gameplay) · [Measurements](#measurements) · [Benchmark dashboard](https://taynangt.github.io/Vice-Tay/)
+[Quick start](#getting-started) · [Measurements](#measurements) · [Measurements on GitHub Pages](https://taynangt.github.io/Vice-Tay/)
 
 ## Measurements
 
-The goal is **30 rendered FPS in the open world with correct visuals**. Both sessions used the Series S profile.
+The goal is **30 rendered FPS in the open world with correct visuals**.
+
+### Series S boat test at 4K
+
+On November 27, 2026, I repeated the same boat route with two local builds. Both used DLSS Quality (2560 × 1440 → 3840 × 2160) and AMD 2× frame generation. Each result averages about 39 seconds of telemetry.
+
+| Build | Rendered FPS | Generated FPS | Presented FPS |
+| --- | ---: | ---: | ---: |
+| 4K reference · `e9a30f4f` | 16.12 | 16.12 | 32.25 |
+| 4K experimental · `424fb3f6` | **26.72** | 26.72 | **53.44** |
+
+The experimental build reached a median of 27.80 rendered FPS across the sampled intervals. The Series S 4K option is under review in [PR #329](https://github.com/TaynanGT/Vice-Tay/pull/329).
+
+[4K settings, frame counts and percentiles](docs/measurements.md#series-s-4k-boat-test)
+
+### Earlier Series S measurements
 
 | Session | Result |
 | --- | --- |
-| **30-minute playtest** · `bc090416` | Median of **21.1 rendered FPS**. The run covered the prologue and boat section, then continued on foot on the island. |
-| **6-minute frame generation test** · `88e80129` | Medians of **22.4 rendered FPS** and **44.9 presented FPS** with 2× frame generation on an experimental build. |
+| **1080p GPU read-through test** | An on/off test with the boat stationary went from **22.60 to 26.38 rendered FPS** and **45.13 to 52.78 presented FPS**. |
+| **6-minute frame generation test** · `88e80129` | Medians of **22.4 rendered FPS** and **44.9 presented FPS** in a separate 1080p test with 2× frame generation. |
+| **30-minute playtest** · `bc090416` | Median of **21.1 rendered FPS** and a 17.0 FPS 1% low across the prologue, the boat section and traversal on foot. |
 
-The playtest logged a 17.0 FPS 1% low, a measure of its slowest frames, and peaked at 24.1 GB of private game memory. The frame generation sample used DLSS Quality to scale 720p to 1080p and AMD FSR 3.1.6 to generate frames between rendered frames.
-
-[Playtest measurements](docs/measurements.md#series-s-baseline) · [Frame generation settings and sample](docs/measurements.md#series-s-frame-generation)
+[1080p comparison](docs/measurements.md#series-s-1080p-gpu-read-through) · [Frame generation test](docs/measurements.md#series-s-frame-generation) · [30-minute playtest](docs/measurements.md#series-s-baseline)
 
 **Test PC** · RTX 4090 (24 GB), Ryzen 9 9950X3D, 48 GiB DDR5, Windows 11 Pro x64
 
@@ -35,15 +58,7 @@ The playtest logged a 17.0 FPS 1% low, a measure of its slowest frames, and peak
 
 </details>
 
-## Gameplay
-
-Checkpoint retries worked after the boat ran aground. The HUD, minimap, mission prompts and pause menu were usable along the route.
-
-This clip shows the boat section with the diagnostics overlay. It displays frame times, draw counts, CPU and GPU load, and memory use. Press **F3** to toggle it in a diagnostics build.
-
-https://github.com/user-attachments/assets/bd07891c-c53f-4f46-9b7e-80463c379b84
-
-[Browse ten screenshots from the Series S playtest on build `672cf831`](https://github.com/TaynanGT/Vice-Tay-Screenshots#readme)
+In the 30-minute playtest, checkpoint retries worked after the boat ran aground. The HUD, minimap, mission prompts and pause menu were usable along the route.
 
 ## Getting started
 
@@ -51,6 +66,7 @@ https://github.com/user-attachments/assets/bd07891c-c53f-4f46-9b7e-80463c379b84
 
 > [!IMPORTANT]
 > Bring your own copy of the title. Keep the executable, game data and derived cache outside this checkout. See the [asset policy](docs/asset-policy.md).
+> The runtime reports unverified game and package licences as inactive. A title that requires a verified licence may stop at startup.
 
 1. Clone the repository and copy the configuration template.
 
@@ -69,16 +85,23 @@ https://github.com/user-attachments/assets/bd07891c-c53f-4f46-9b7e-80463c379b84
 
 Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command Prompt. Double-click it to enter the executable's path at a prompt. The launcher defaults to full screen, the Series X profile and an automatic GPU preset. **F11** or **Alt+Enter** toggles full screen during play.
 
+For titles that use BCPack, set `VICTORY_BCPACK_TABLES` to the path of a local copy of the [format tables](docs/asset-policy.md#bcpack) you are authorised to use.
+
+If the title reaches the menu but stops at world load, verify your title files before changing graphics settings. Compare the full file hashes against a trusted manifest for the exact release you own, using the algorithm listed in that manifest. An archive with missing or zero-filled data can still have the expected size. Re-copy any mismatched files from your verified source and check the hashes again before launching.
+
 | Option | Use it to |
 | --- | --- |
 | `-Console series-s` | Select the lighter console profile used in the sessions above. |
 | `-Machine 4090` / `-Machine 4070` / `-Machine 7900xtx` | Select a GPU preset explicitly. See the [RTX 4070 test notes](docs/rtx4070-performance.md). |
-| `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. |
+| `-Machine 4070tisuper` | The RTX 4070 Ti SUPER (16 GB) preset, asked for explicitly. With Resizable BAR on, it moves up to 4 GB of shader-read windows from RAM into the card's memory. Also [measured on an RTX 5080 with eight cores](docs/rtx5080-16gb.md), where it ran one scene at 27 fps against 16 with the RTX 4090 settings. |
 | `-Machine laptop` | Try the [16 GB NVIDIA laptop preset](docs/laptop-16gb.md), measured on one RTX 3050 laptop. |
+| `-Machine 3060` | Try the [six-core, 16 GB NVIDIA desktop preset](docs/rtx3060-16gb.md), measured on one RTX 3060 12 GB / i5-12400F PC. |
 | `-Safe` | Launch with the conservative settings when investigating a graphics or stability issue. |
 | `-Windowed` / `-NoPanel` | Start in a window or hide the diagnostics overlay at launch. |
 | `-RayTracing` | Enable the structures needed for the title's ray-traced indirect lighting. |
 | `-Fsr4K quality` / `-Dlss4K quality` | Upscale to 3840 × 2160 with PC FSR or DLSS on Series X. |
+| `-FrameIntervalMs 16.67` | Set the frame interval in milliseconds. Use `0` to remove the limit or omit the option to keep the title's setting. |
+| `-WarmPipelines` | Warm pipelines used in previous runs before starting the title. |
 | `-Build release` | Use the executable built with `cargo build --locked --release -p victory`. The overlay requires a diagnostics build. |
 
 <details>
@@ -87,12 +110,15 @@ Use [`Play-VIctory.cmd`](Play-VIctory.cmd) to pass the same options from Command
 The Series X 4K profiles support `quality`, `balanced` and `performance` on
 build 1.0.2.1. They render at 2560 × 1440, 2258 × 1270 and 1920 × 1080
 respectively. For Series S, use `-Dlss` or `-Fsr` with the same three
-presets to keep the console profile's output size.
+presets to keep the console profile's output size. These presets set the
+render scale, including when used with `-Machine laptop`.
 
 For FSR, point `VICTORY_FIDELITYFX_DIR` or `[paths].fidelityfx_dir` at the
 folder containing `amd_fidelityfx_upscaler_dx12.dll`. The 4K mode prefers
-FSR 4.1.2 and uses 3.1.6 when that is what the adapter supports. Series S
-uses FSR 3.1.6. Both profiles can use FSR when DLSS fails.
+FSR 4.1.2 and uses 3.1.6 when that is what the adapter supports. In Series S,
+pass `-More @{VICTORY_FSR4_SERIES_S='1'}` to prefer FSR 4.1.2 on a supported
+adapter. Series S uses FSR 3.1.6 by default. Both profiles can use FSR when
+DLSS fails.
 For DLSS on an RTX card, get `nvngx_dlss.dll` from the NVIDIA DLSS SDK.
 Set `VICTORY_DLSS_DIR` or `[paths].dlss_dir` to its folder, or put the DLL
 beside `victory.exe`. Some drivers ship without this library. Vice-Tay
@@ -126,7 +152,7 @@ through beloooo's port. The frame generation bridge follows
 <details>
 <summary>Shader cache and pipeline warm-up</summary>
 
-The launcher pretranslates shaders when the cache has fewer than 1,000 entries. It uses `game_dir` when configured and falls back to the executable's directory. The driver may still build pipelines during the first run.
+The launcher pretranslates shaders when it has no completed scan for the current shader cache key and source paths. On Windows it uses `game_dir` when configured and falls back to the executable's directory. The driver may still build pipelines during the first run.
 
 Run these steps separately from the repository root to warm the shader cache and compile pipelines seen in previous runs. Both steps can resume from cached work.
 
@@ -135,7 +161,13 @@ Run these steps separately from the repository root to warm the shader cache and
 .\target\diag\victory.exe warm --used
 ```
 
-Pass an archive path to `shaders` to scan just that archive. `-SkipShaders` skips pretranslation at launch.
+Pass an archive path to `shaders` to scan just that archive. At launch, `--if-needed` checks file metadata throughout each input directory before reusing a completed scan. On Windows volumes that do not report file change times, it scans the input again. `-SkipShaders` skips pretranslation at launch.
+`-WarmPipelines` runs the same `warm --used` command after pretranslation.
+When comparing warm-up times, `warm --used --batch-size 80` tests longer batches and
+`warm --used --normal-priority` tests normal worker priority. Change one option
+at a time. The defaults are 40 pipelines per worker process and idle priority.
+
+The opening's head blend-shape map starts compiling when its pipeline is created. Its dispatch can wait up to two seconds for the result. After a timeout, later dispatches use the pipeline as soon as it is ready. Set `VICTORY_HEAD_MAP_WAIT=0` for the ordinary pipeline schedule and wait budget.
 
 </details>
 
@@ -214,4 +246,4 @@ Vice-Tay grew out of codec-d's `cool_fox`, which brought NVIDIA work to avatarma
 
 ## License
 
-[GPL-3.0-or-later](LICENSE), inherited from VIctory. The [asset policy](docs/asset-policy.md#the-one-exception) records the separate BCPack format tables. Vice-Tay is independent of the title's developer and publisher.
+[GPL-3.0-or-later](LICENSE), inherited from VIctory. Vice-Tay is independent of the title's developer and publisher.

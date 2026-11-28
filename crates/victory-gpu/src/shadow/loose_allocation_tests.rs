@@ -36,11 +36,11 @@ impl CellFixture {
             assert!(!committed.is_null());
             cells.push(cell);
         }
-        Self {
-            base,
-            end: first + count as u64 * WINDOW,
-            cells,
-        }
+        let end = first + count as u64 * WINDOW;
+        // Another test may have left a window or view on addresses it freed
+        // and Windows has just handed to us; nothing of ours is there yet.
+        forget_overlapping(first, end);
+        Self { base, end, cells }
     }
 
     fn commit_at(&self, addr: u64, len: usize) {
@@ -59,30 +59,29 @@ impl CellFixture {
     }
 }
 
+/// Takes every loose window and exact view that overlaps `[lo, hi)` out of
+/// the tables (keys are `(start, len)`), and drops them outside the locks.
+fn forget_overlapping(lo: u64, hi: u64) {
+    let overlaps = |&(start, len): &(u64, u64)| start < hi && start.saturating_add(len.max(1)) > lo;
+    let dropped_loose: Vec<Arc<Shadow>> = {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map.range(..(hi, 0)).map(|(&k, _)| k).filter(overlaps).collect();
+        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    let dropped_exact: Vec<Arc<Shadow>> = {
+        let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map.range(..(hi, 0)).map(|(&k, _)| k).filter(overlaps).collect();
+        keys.into_iter()
+            .filter_map(|k| map.remove(&k).map(|(s, _)| s))
+            .collect()
+    };
+    drop(dropped_loose);
+    drop(dropped_exact);
+}
+
 impl Drop for CellFixture {
     fn drop(&mut self) {
-        let lo = self.cells[0];
-        let hi = self.end;
-        let dropped_loose: Vec<Arc<Shadow>> = {
-            let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-            let keys: Vec<(u64, u64)> = map
-                .range((lo, 0)..(hi, 0))
-                .map(|(&k, _)| k)
-                .collect();
-            keys.into_iter().filter_map(|k| map.remove(&k)).collect()
-        };
-        let dropped_exact: Vec<Arc<Shadow>> = {
-            let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
-            let keys: Vec<(u64, u64)> = map
-                .range((lo, 0)..(hi, 0))
-                .map(|(&k, _)| k)
-                .collect();
-            keys.into_iter()
-                .filter_map(|k| map.remove(&k).map(|(s, _)| s))
-                .collect()
-        };
-        drop(dropped_loose);
-        drop(dropped_exact);
+        forget_overlapping(self.cells[0], self.end);
         // SAFETY: releases our private reservation after all table entries are gone.
         unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
     }

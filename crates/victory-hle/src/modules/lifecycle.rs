@@ -717,6 +717,9 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // Capture pictures still in the line of the thread that writes them.
+    #[cfg(windows)]
+    victory_gpu::finish_captures();
     // DLSS's features and NGX, before the device goes with the process.
     #[cfg(windows)]
     crate::modules::fidelityfx::shut_down();

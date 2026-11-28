@@ -4,6 +4,10 @@
 //! thread looks for new pads every [`SCAN`]; each pad has a reader thread
 //! that keeps its latest state until the pad goes away. By default XInput
 //! has priority over HID, since a remapper can present the same pad twice.
+//! A USB DualSense read over HID takes the title's rumble over HID too
+//! ([`feedback`]), from a writer thread.
+
+mod feedback;
 
 use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
@@ -95,7 +99,7 @@ fn mac(pairing: &[u8]) -> Option<[u8; 6]> {
 }
 
 #[cfg(windows)]
-pub(super) use host::pads;
+pub(super) use host::{pads, set_motors};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -154,7 +158,7 @@ pub(super) fn slots(
 #[cfg(windows)]
 mod host {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{LazyLock, Mutex, PoisonError};
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
     use std::time::Duration;
 
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -172,13 +176,14 @@ mod host {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        ReadFile,
+        ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::IO::{
         CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
     };
     use windows_sys::Win32::System::Threading::CreateEventW;
 
+    use super::feedback::{self, Motors};
     use super::{DUALSHOCK4_PRODUCTS, PRODUCTS, PadState, ReportKind, SONY, mac, parse};
 
     /// How often to look for newly connected pads.
@@ -199,6 +204,22 @@ mod host {
         mac: Option<[u8; 6]>,
         /// `None` until the first report, and while the pad is silent.
         state: Option<PadState>,
+        /// Its rumble; `None` but for a USB DualSense.
+        out: Option<Arc<Output>>,
+    }
+
+    /// A USB DualSense's rumble. The writer thread holds `handle`'s lock
+    /// while it writes; the reader sets it to `None` before closing the
+    /// handle.
+    struct Output {
+        handle: Mutex<Option<usize>>,
+        /// The output report length the device asks for.
+        len: usize,
+        /// The firmware update version (feature report 0x20), 0 when unknown.
+        firmware: u16,
+        want: Mutex<Motors>,
+        /// `None` until the first report: the first wish is sent whatever it is.
+        sent: Mutex<Option<Motors>>,
     }
 
     /// The open pads, in the order they were found.
@@ -237,6 +258,8 @@ mod host {
     struct Reports {
         input: Vec<u8>,
         feature: Vec<u8>,
+        /// Output report length, 0 when the collection has none.
+        output: usize,
     }
 
     impl Reports {
@@ -267,6 +290,7 @@ mod host {
             Some(Self {
                 input: vec![0; usize::from(caps.InputReportByteLength)],
                 feature: vec![0; usize::from(caps.FeatureReportByteLength)],
+                output: usize::from(caps.OutputReportByteLength),
             })
         }
     }
@@ -356,6 +380,26 @@ mod host {
             } else {
                 None
             };
+            // Rumble for a USB DualSense whose output report is the one we
+            // know (at least 48 bytes).
+            let out = (matches!(kind, ReportKind::DualSenseUsb)
+                && (feedback::USB_OUTPUT_LEN..=128).contains(&reports.output))
+            .then(|| {
+                let firmware = if reports.feature.len() >= 64
+                    && feature(handle, feedback::FEATURE_FIRMWARE_ID, &mut reports.feature)
+                {
+                    feedback::firmware_version(&reports.feature).unwrap_or(0)
+                } else {
+                    0
+                };
+                Arc::new(Output {
+                    handle: Mutex::new(Some(handle as usize)),
+                    len: reports.output,
+                    firmware,
+                    want: Mutex::new(Motors::default()),
+                    sent: Mutex::new(None),
+                })
+            });
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
             let id = {
                 let mut pads = lock();
@@ -367,6 +411,7 @@ mod host {
                         path: path.clone(),
                         mac,
                         state: None,
+                        out: out.clone(),
                     });
                     id
                 })
@@ -383,13 +428,25 @@ mod host {
                 unsafe { CloseHandle(handle) };
                 continue;
             };
-            tracing::info!(path = %lower, bluetooth, "PlayStation gamepad connected");
+            tracing::info!(
+                path = %lower,
+                bluetooth,
+                rumble = out.is_some(),
+                firmware = format_args!("{:#06x}", out.as_ref().map_or(0, |out| out.firmware)),
+                "PlayStation gamepad connected"
+            );
             let raw = handle as usize;
             if let Err(error) = std::thread::Builder::new()
                 .name("PlayStation gamepad reader".into())
-                .spawn(move || read(raw as HANDLE, id, kind, reports))
+                .spawn({
+                    let out = out.clone();
+                    move || read(raw as HANDLE, id, kind, reports, out)
+                })
             {
                 lock().retain(|pad| pad.id != id);
+                if let Some(out) = &out {
+                    *out.handle.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                }
                 // SAFETY: just opened, and no reader has it.
                 unsafe { CloseHandle(handle) };
                 tracing::warn!(%error, "could not start a PlayStation gamepad reader");
@@ -398,7 +455,13 @@ mod host {
     }
 
     /// Reads reports until the pad goes away, then forgets it.
-    fn read(handle: HANDLE, id: u64, kind: ReportKind, mut reports: Reports) {
+    fn read(
+        handle: HANDLE,
+        id: u64,
+        kind: ReportKind,
+        mut reports: Reports,
+        out: Option<Arc<Output>>,
+    ) {
         let bluetooth = matches!(kind, ReportKind::DualSenseBluetooth);
         let set = |state: Option<PadState>| {
             if let Some(pad) = lock().iter_mut().find(|pad| pad.id == id) {
@@ -465,6 +528,10 @@ mod host {
         };
         tracing::info!(why, bluetooth, "PlayStation gamepad disconnected");
         lock().retain(|pad| pad.id != id);
+        if let Some(out) = out {
+            // No write of the writer thread is under way or starts after this.
+            *out.handle.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
         // SAFETY: ours, and nothing uses them any more.
         unsafe {
             if !event.is_null() {
@@ -472,6 +539,132 @@ mod host {
             }
             CloseHandle(handle);
         }
+    }
+
+    /// Asks the HID pad `id` for these motor speeds (heavy, light; 0 to
+    /// 65535, as XInput has them); only a USB DualSense takes them.
+    pub(in super::super) fn set_motors(id: u64, heavy: u16, light: u16) {
+        static WRITER: LazyLock<()> = LazyLock::new(|| {
+            if let Err(error) = std::thread::Builder::new()
+                .name("PlayStation gamepad writer".into())
+                .spawn(writer)
+            {
+                tracing::warn!(%error, "could not start the PlayStation gamepad writer");
+            }
+        });
+        if !feedback::rumble_on() {
+            return;
+        }
+        let Some(out) = lock()
+            .iter()
+            .find(|pad| pad.id == id)
+            .and_then(|pad| pad.out.clone())
+        else {
+            return;
+        };
+        let byte = |speed: u16| (speed >> 8) as u8;
+        *out.want.lock().unwrap_or_else(PoisonError::into_inner) = Motors {
+            heavy: byte(heavy),
+            light: byte(light),
+        };
+        LazyLock::force(&WRITER);
+    }
+
+    /// Reports at most this often per pad: rumble levels change every frame.
+    const WRITE_EVERY: Duration = Duration::from_millis(10);
+    /// A write that takes longer is cancelled (a pad going away).
+    const WRITE_WAIT_MS: u32 = 100;
+
+    /// Sends each pad's motors when they differ from what it was last sent.
+    fn writer() {
+        // SAFETY: an unnamed manual-reset event; no security attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            tracing::warn!("PlayStation gamepad writer: no event");
+            return;
+        }
+        // Say once that reports go out, and once if one does not.
+        let (mut told_sent, mut told_failed) = (false, false);
+        loop {
+            std::thread::sleep(WRITE_EVERY);
+            let outs: Vec<Arc<Output>> = lock().iter().filter_map(|pad| pad.out.clone()).collect();
+            for out in outs {
+                let want = *out.want.lock().unwrap_or_else(PoisonError::into_inner);
+                if *out.sent.lock().unwrap_or_else(PoisonError::into_inner) == Some(want) {
+                    continue;
+                }
+                let report = feedback::usb(want, out.firmware, out.len);
+                let handle = out.handle.lock().unwrap_or_else(PoisonError::into_inner);
+                let Some(raw) = *handle else {
+                    continue;
+                };
+                let done = write(raw as HANDLE, event, &report);
+                drop(handle);
+                match done {
+                    Ok(written) if feedback::whole(written, report.len()) => {
+                        *out.sent.lock().unwrap_or_else(PoisonError::into_inner) = Some(want);
+                        if !told_sent && want != Motors::default() {
+                            told_sent = true;
+                            tracing::info!(
+                                heavy = want.heavy,
+                                light = want.light,
+                                bytes = report.len(),
+                                written,
+                                "PlayStation gamepad: first rumble report sent"
+                            );
+                        }
+                    }
+                    done if !told_failed => {
+                        told_failed = true;
+                        tracing::warn!(
+                            ?done,
+                            bytes = report.len(),
+                            "PlayStation gamepad: a rumble report was not written whole"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// One output report, waited for at most [`WRITE_WAIT_MS`]: the bytes
+    /// written as the driver counts them, or the error.
+    fn write(handle: HANDLE, event: HANDLE, report: &[u8]) -> Result<u32, u32> {
+        // SAFETY: plain data; only the event is set.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event;
+        let mut got = 0;
+        // SAFETY: `report` and `overlapped` outlive the write: every way out
+        // below waits for it to end first.
+        let started = unsafe {
+            WriteFile(
+                handle,
+                report.as_ptr(),
+                report.len() as u32,
+                std::ptr::null_mut(),
+                &mut overlapped,
+            )
+        };
+        if started == 0 {
+            // SAFETY: plain query.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_IO_PENDING {
+                return Err(error);
+            }
+        }
+        // SAFETY: the write started above.
+        if unsafe { GetOverlappedResultEx(handle, &overlapped, &mut got, WRITE_WAIT_MS, 0) } != 0 {
+            return Ok(got);
+        }
+        // SAFETY: plain query.
+        let error = unsafe { GetLastError() };
+        // SAFETY: cancel and wait for the write to end before `report` goes.
+        unsafe {
+            CancelIoEx(handle, &overlapped);
+            GetOverlappedResult(handle, &overlapped, &mut got, 1);
+        }
+        Err(error)
     }
 
     /// The pad at `path` opened for reading, `None` when it is something else

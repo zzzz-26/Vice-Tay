@@ -14,8 +14,9 @@
 //!   left alone: `x + 0.0` and `x * 1.0` are not `x` for every `x`.
 //! - [`REUSE`]: an instruction without an effect whose operands are those
 //!   of an earlier one that every path to it has run gives that one's
-//!   result (a descriptor handle made again in each block, an index clamped
-//!   again, a register read as a float again).
+//!   result (a descriptor handle made again in each block, a register read
+//!   as a float again; per-handle index clamps and `dx.op.getDimensions`
+//!   queries stay separate for AMD's RDNA4 compiler).
 //! - [`FACTS`]: in the blocks only one side of a branch leads to, the
 //!   branch's condition is that side's constant, and so is what the
 //!   condition was made of (both terms of an `and` that held, the opposite
@@ -33,8 +34,8 @@
 use std::collections::HashMap;
 
 use super::{
-    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
-    successors,
+    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Tag, Term, Ty, TypeDef, V, for_each_operand,
+    pred, successors,
 };
 
 /// Dead-code elimination.
@@ -724,6 +725,13 @@ impl Module {
     }
 
     fn key(&self, i: u32) -> Option<Key> {
+        // Index clamps stay one per handle: sharing one clamped index across
+        // two heap handles (for example a structured and a byte-address view,
+        // or a buffer's size query and its loads) makes AMD's RDNA4 compiler
+        // (`amdxc64.dll+0x861b9f`, driver 32.0.32029.2010) read a null pointer.
+        if self.tags.get(&i) == Some(&Tag::Clamp) {
+            return None;
+        }
         let inst = &self.insts[i as usize];
         Some(match &inst.op {
             Op::Bin(op, a, b) => {
@@ -743,6 +751,19 @@ impl Module {
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
+            // A size query stays where the lowering put it: AMD's RDNA4 D3D12
+            // compiler (`amdxc64.dll+0x861b9f`, driver 32.0.32029.2010) crashes
+            // making compute pipelines when one `dx.op.getDimensions` serves
+            // the uses of another below it.
+            Op::Call(f, _)
+                if self.funcs[*f as usize]
+                    .name
+                    .strip_prefix("dx.op.")
+                    .unwrap_or(&self.funcs[*f as usize].name)
+                    .starts_with("getDimensions") =>
+            {
+                return None;
+            }
             Op::Call(f, args) => Key::Call(*f, args.clone()),
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
@@ -1501,6 +1522,108 @@ mod tests {
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
         m.write();
+    }
+
+    #[test]
+    fn a_size_query_is_not_reused() {
+        for passes in [0, REUSE, REUSE | LOADS, ALL] {
+            let Diamond {
+                k:
+                    Kit {
+                        mut m, b, writes, ..
+                    },
+                x,
+                y,
+                then,
+                ..
+            } = diamond();
+            let i32t = m.int(32);
+            let fty = m.func_ty(i32t, vec![i32t, i32t]);
+            m.ptr(fty);
+            let dims = m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+            let first = m.call(b, dims, vec![x, y]);
+            let same_block = m.call(b, dims, vec![x, y]);
+            let unused = m.call(b, dims, vec![x, y]);
+            let _ = unused;
+            m.call(b, writes, vec![first, same_block]);
+            let below = m.call(then, dims, vec![x, y]);
+            m.call(then, writes, vec![below, below]);
+            m.optimise(passes);
+            assert_eq!(
+                stores(&m, b),
+                [[first, same_block]],
+                "same-block getDimensions merged under passes={passes:#x}"
+            );
+            assert_eq!(
+                stores(&m, then),
+                [[below, below]],
+                "dominated getDimensions merged under passes={passes:#x}"
+            );
+            assert_eq!(body(&m, then), 2, "passes={passes:#x}");
+            let V::Inst(unused_id) = unused else {
+                panic!()
+            };
+            if passes & DEAD != 0 {
+                assert!(
+                    !m.blocks[b].body.contains(&unused_id),
+                    "dead getDimensions was not eliminated under passes={passes:#x}"
+                );
+            }
+            m.write();
+        }
+    }
+
+    #[test]
+    fn clamped_indices_are_not_reused() {
+        for passes in [0, REUSE, REUSE | LOADS, ALL] {
+            let Diamond {
+                k:
+                    Kit {
+                        mut m, b, writes, ..
+                    },
+                x,
+                y,
+                then,
+                ..
+            } = diamond();
+            let i32t = m.int(32);
+            let fty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
+            m.ptr(fty);
+            let bin = m.function("dx.op.binary.i32", fty, Some(Attr::ReadNone), false);
+            let op_umin = m.i32(40);
+            let c1 = m.call(b, bin, vec![op_umin, x, y]);
+            m.tag(c1, Tag::Clamp);
+            let c2 = m.call(b, bin, vec![op_umin, x, y]);
+            m.tag(c2, Tag::Clamp);
+            let unused = m.call(b, bin, vec![op_umin, x, y]);
+            m.tag(unused, Tag::Clamp);
+            m.call(b, writes, vec![c1, c2]);
+            let c3 = m.call(then, bin, vec![op_umin, x, y]);
+            m.tag(c3, Tag::Clamp);
+            m.call(then, writes, vec![c3, c3]);
+            m.optimise(passes);
+            assert_eq!(
+                stores(&m, b),
+                [[c1, c2]],
+                "same-block Tag::Clamp merged under passes={passes:#x}"
+            );
+            assert_eq!(
+                stores(&m, then),
+                [[c3, c3]],
+                "dominated Tag::Clamp merged under passes={passes:#x}"
+            );
+            assert_eq!(body(&m, then), 2, "passes={passes:#x}");
+            let V::Inst(unused_id) = unused else {
+                panic!()
+            };
+            if passes & DEAD != 0 {
+                assert!(
+                    !m.blocks[b].body.contains(&unused_id),
+                    "dead Tag::Clamp was not eliminated under passes={passes:#x}"
+                );
+            }
+            m.write();
+        }
     }
 
     #[test]

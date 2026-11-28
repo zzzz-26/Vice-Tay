@@ -19,6 +19,25 @@ direct draw, indexed draw or mesh dispatch includes the reason, pipeline
 recipe key and guest shader hashes when a pipeline was set. Draws that reach
 the GPU can still produce incorrect geometry, depth or materials.
 
+## Inspect the scene before frame generation
+
+With frame generation enabled, set `VICTORY_CAPTURE_SCENE_BEFORE_FRAMEGEN=1`
+and the capture folder above. List specific frames or create an empty
+`scene-next` file in that folder while the title is running. The next
+eligible present consumes the file. This mode saves requested frames only.
+Each `scene-<frame>.png` shows the scene at full output resolution before
+interpolation. The diagnostics panel and any separately submitted title UI
+are composed afterwards. A HUD already drawn into the scene stays in the
+image. The swap chain still presents with frame generation when its input is
+ready. Match the frame number and timestamp in the log to the recorded
+output. Exclude the synchronous readback from timing samples.
+
+Use an empty `scene-trace` file to save the scene with
+`frame-<frame>-ops.txt`. The title drains recording work at the beginning
+and end of the selected frame. With `VICTORY_DUMP_TARGETS=1`, the same
+request also saves the textures written during that frame. Match their
+resource IDs to the draws and dispatches in the operation list.
+
 ## Recording
 
 Off unless `VICTORY_RECORD` is set. Build with
@@ -84,7 +103,7 @@ with the presented one.
 | `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |
 | `--skip-shader <text>` | leaves out what runs pipelines with the text in their name or DXIL hash (repeatable) |
 | `--shaders <folder>` | takes shaders from the folder where it has them: `<hash>.dxil`, by the hash the runtime names the title's shader by (a pass of ours: its own DXIL hash); with `--compare --shaders-b <folder>` a second set, turn by turn with the first |
-| `--retranslate <folder>` | only writes that folder: the capture's shaders translated by this build with the `VICTORY_*` switches of this run (`--view-limit`, `--raw-views`: the view heap's null slot and where raw views start, as the capture's shaders have them) |
+| `--retranslate <folder>` | Translate the capture's shaders into that folder. Use `--view-limit` and `--raw-views` to match the captured heap. Set `VICTORY_HOST_WAVE` (or `VICTORY_HOST_MAX_WAVE`) and `VICTORY_HOST_RDNA` to match the replay adapter. The defaults are 64 lanes and RDNA float settings. |
 | `--no-restore` | leaves what a loop changed, and makes no copies to restore from (of a capture that does not fit in the card's memory with them) |
 | `--pace <ms>` | a wait after each submission sent: the card stands idle between them, as in a game that prepares the next one |
 | `--awake` | keeps the card's clocks up (`VICTORY_CARD_AWAKE=1`) |

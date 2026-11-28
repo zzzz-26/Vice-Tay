@@ -26,7 +26,49 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+fn bad_keys<'a>(text: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    let hex = |word: &str, len| word.len() == len && word.bytes().all(|b| b.is_ascii_hexdigit());
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let first = words.next()?;
+            let second = words.next();
+            let (key, recorded) = match second {
+                // Accept journals written by builds that put the fingerprint first.
+                Some(key) if hex(first, 16) && hex(key, 32) => (key, Some(first)),
+                _ => (first, second.and_then(|word| word.strip_prefix("fp=")).filter(|fp| hex(fp, 16))),
+            };
+            (hex(key, 32) && recorded.is_none_or(|fp| fp.eq_ignore_ascii_case(fingerprint))).then_some(key)
+        })
+        .collect()
+}
+
+fn completed_keys<'a>(text: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    text.lines()
+        .filter_map(|line| {
+            // Older journals also counted refusals as completed.
+            let (recorded, key) = line.strip_prefix("v2 ")?.split_once(' ')?;
+            (recorded == fingerprint).then_some(key)
+        })
+        .collect()
+}
+
+fn record_completion(out: &mut impl Write, fingerprint: &str, key: &str, there: bool) -> Result<()> {
+    if there {
+        writeln!(out, "v2 {fingerprint} {key}").context("writing warm-done.txt")?;
+    }
+    Ok(())
+}
+
+pub fn run(
+    jobs: Option<usize>,
+    batch_size: Option<u16>,
+    normal_priority: bool,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    these: Option<String>,
+) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -42,16 +84,13 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad_file = dir.join("warm-bad.txt");
     let entries = known::warm_entries(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
-    let mut done: HashSet<&str> = HashSet::new();
-    for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
-        {
-            done.insert(key);
-        }
-    }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let done = completed_keys(&listed, &fingerprint);
+    let listed_bad = if again || std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+        String::new()
+    } else {
+        std::fs::read_to_string(&bad_file).unwrap_or_default()
+    };
+    let bad = bad_keys(&listed_bad, &fingerprint);
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -66,6 +105,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
+    let batch_size = batch_size.map_or(AT_ONCE, usize::from);
     let skipped = entries.iter().filter(|entry| entry.skipped).count();
     println!(
         "{} pipelines known, {} made before ({fingerprint}), {} bad, {skipped} skipped by VICTORY_SKIP_PIPELINES. {} to make, {jobs} processes",
@@ -82,7 +122,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     run_batches(
         &all,
         jobs,
-        |indices| start_worker(indices, &entries),
+        batch_size,
+        |indices| start_worker(indices, &entries, normal_priority),
         |n, ms, there| {
             if ms >= SLOW_MS {
                 writeln!(lock(&slow_out), "\n{} {ms:.0}", entries[n].key).context("writing slow-pipelines.txt")?;
@@ -95,11 +136,12 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
-            writeln!(lock(&done_out), "{fingerprint} {}", entries[n].key).context("writing warm-done.txt")
+            record_completion(&mut *lock(&done_out), &fingerprint, &entries[n].key, there)
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", entries[n].key);
-            writeln!(lock(&bad_out), "{} {why}", entries[n].key).context("writing warm-bad.txt")?;
+            // Keep the key in column one for older readers of this journal.
+            writeln!(lock(&bad_out), "{} fp={fingerprint} {why}", entries[n].key).context("writing warm-bad.txt")?;
             lock(&state).2 += 1;
             Ok(())
         },
@@ -123,11 +165,12 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
 fn run_batches(
     all: &[usize],
     jobs: usize,
+    batch_size: usize,
     start: impl Fn(&[usize]) -> Result<Child> + Sync,
     each: impl Fn(usize, f64, bool) -> Result<()> + Sync,
     bad: impl Fn(usize, String) -> Result<()> + Sync,
 ) -> Result<()> {
-    let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
+    let chunks: Vec<&[usize]> = all.chunks(batch_size).collect();
     let next = AtomicUsize::new(0);
     // Stop launching workers after a setup failure. In-flight workers can still report.
     let failure = OnceLock::new();
@@ -171,9 +214,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn start_worker(these: &[usize], entries: &[known::WarmEntry]) -> Result<Child> {
+fn start_worker(these: &[usize], entries: &[known::WarmEntry], normal_priority: bool) -> Result<Child> {
     use std::os::windows::process::CommandExt;
     const IDLE_PRIORITY_CLASS: u32 = 0x40;
+    const NORMAL_PRIORITY_CLASS: u32 = 0x20;
     let exe = std::env::current_exe().context("could not locate the warm worker executable")?;
     let list: Vec<String> = these.iter().map(|&index| {
         let recipe = &entries[index];
@@ -184,7 +228,7 @@ fn start_worker(these: &[usize], entries: &[known::WarmEntry]) -> Result<Child> 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .creation_flags(IDLE_PRIORITY_CLASS)
+        .creation_flags(if normal_priority { NORMAL_PRIORITY_CLASS } else { IDLE_PRIORITY_CLASS })
         .spawn()
         .with_context(|| format!("could not spawn {}", exe.display()))
 }
@@ -349,6 +393,29 @@ mod tests {
     use super::*;
     use std::os::windows::process::CommandExt;
 
+    #[test]
+    fn warm_completion_keeps_refusals_and_ambiguous_legacy_records_pending() {
+        let mut journal = b"fingerprint legacy\nv2 earlier old\n".to_vec();
+        record_completion(&mut journal, "fingerprint", "refused", false).unwrap();
+        record_completion(&mut journal, "fingerprint", "compiled", true).unwrap();
+        assert_eq!(
+            completed_keys(std::str::from_utf8(&journal).unwrap(), "fingerprint"),
+            HashSet::from(["compiled"])
+        );
+    }
+
+    #[test]
+    fn quarantine_expires_with_the_fingerprint_and_keeps_legacy_keys() {
+        let [current, stale, legacy, imported] = ['1', '2', '3', '4'].map(|c| c.to_string().repeat(32));
+        let fp = "1234567890abcdef";
+        let other = "ffffffffffffffff";
+        let listed = format!(
+            "# ignored\n\n{current} fp={fp} timed out\n{stale} fp={other}\n{legacy} manual entry\n{fp}\t{imported}\n"
+        );
+        assert_eq!(bad_keys(&listed, fp), HashSet::from([current.as_str(), legacy.as_str(), imported.as_str()]));
+        assert_eq!(bad_keys(&listed, other), HashSet::from([stale.as_str(), legacy.as_str()]));
+    }
+
     fn fake_child(script: &str, stdout: Stdio) -> Result<Child> {
         let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");
         Ok(Command::new(cmd)
@@ -370,6 +437,7 @@ mod tests {
         let result = run_batches(
             &[7, 8, 9],
             1,
+            AT_ONCE,
             |_| {
                 starts.fetch_add(1, Ordering::Relaxed);
                 Ok(Command::new(&missing).spawn()?)
@@ -390,6 +458,7 @@ mod tests {
         let error = run_batches(
             &[1, 2],
             1,
+            AT_ONCE,
             |_| fake_child("exit /b 0", Stdio::null()),
             |_, _, _| panic!("unexpected completion"),
             |_, _| panic!("unexpected bad pipeline"),
@@ -405,6 +474,7 @@ mod tests {
         run_batches(
             &[7, 8, 9],
             1,
+            AT_ONCE,
             |rest| match rest {
                 [7, 8, 9] => fake_child("echo at 7&echo made 7 3.5 1&echo at 8&exit /b -2005270523", Stdio::piped()),
                 [9] => fake_child("echo at 9&echo made 9 2.0 0", Stdio::piped()),
@@ -422,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn batches_follow_the_requested_size() {
+        let sizes = Mutex::new(Vec::new());
+        run_batches(
+            &[1, 2, 3],
+            1,
+            2,
+            |batch| {
+                lock(&sizes).push(batch.len());
+                let lines: Vec<_> = batch.iter().map(|key| format!("echo at {key}&echo made {key} 1 1")).collect();
+                fake_child(&lines.join("&"), Stdio::piped())
+            },
+            |_, _, _| Ok(()),
+            |_, _| panic!("unexpected bad pipeline"),
+        )
+        .unwrap();
+        assert_eq!(*lock(&sizes), [2, 1]);
+    }
+
+    #[test]
     fn startup_failure_preserves_another_workers_completion() {
         // Hold the failed start until its peer has reported the only key in its chunk.
         let keys: Vec<_> = (0..=AT_ONCE).collect();
@@ -430,6 +519,7 @@ mod tests {
         let error = run_batches(
             &keys,
             2,
+            AT_ONCE,
             |chunk| {
                 if chunk[0] == 0 {
                     assert_eq!(lock(&received).recv_timeout(Duration::from_secs(5)).unwrap(), AT_ONCE);
@@ -451,6 +541,7 @@ mod tests {
             let error = run_batches(
                 &[7, 8, 9],
                 1,
+                AT_ONCE,
                 |_| fake_child(&format!("echo at 7&echo made 7 3.5 1&echo at 8&exit /b {code}"), Stdio::piped()),
                 |n, _, _| { lock(&done).push(n); Ok(()) },
                 |_, _| panic!("generic failures must not blacklist a pipeline"),
@@ -469,7 +560,7 @@ mod tests {
         ] {
             let done = Mutex::new(Vec::new());
             let error = run_batches(
-                &[7, 8], 1,
+                &[7, 8], 1, AT_ONCE,
                 |_| fake_child(script, Stdio::piped()),
                 |n, _, _| { lock(&done).push(n); Ok(()) },
                 |_, _| panic!("incomplete success must not blacklist a pipeline"),
@@ -511,7 +602,7 @@ mod tests {
             "echo at 7&echo made 7 1 2",
         ] {
             assert!(run_batches(
-                &[7, 8], 1,
+                &[7, 8], 1, AT_ONCE,
                 |_| fake_child(script, Stdio::piped()),
                 |_, _, _| panic!("invalid report"),
                 |_, _| panic!("invalid report"),
@@ -522,7 +613,7 @@ mod tests {
     #[test]
     fn journal_failure_reaches_the_caller() {
         let error = run_batches(
-            &[7, 8], 1,
+            &[7, 8], 1, AT_ONCE,
             |_| fake_child("echo at 7&echo made 7 1 1", Stdio::piped()),
             |_, _, _| anyhow::bail!("journal unavailable"),
             |_, _| panic!("journal error must not blacklist a pipeline"),

@@ -623,6 +623,33 @@ impl State {
         self.root_uav_slots.clear();
         self.tables_gone = true;
     }
+
+    /// Number of dynamic descriptor slots still held by this list waiting for
+    /// retirement.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn pending_dynamic_slots(&self) -> u64 {
+        self.dynamic.iter().map(|&(_, _, _, n)| u64::from(n)).sum()
+    }
+}
+
+#[cfg(test)]
+mod dynamic_slot_tests {
+    use super::State;
+
+    #[test]
+    fn pending_dynamic_slots_clears_after_tables_done() {
+        let mut state = State::default();
+        assert_eq!(state.pending_dynamic_slots(), 0);
+        // Unknown heap addresses: `release_dynamic` is a safe no-op.
+        state.dynamic.push((0x1000, 1, 0, 12));
+        state.dynamic.push((0x1000, 1, 16, 4));
+        assert_eq!(state.pending_dynamic_slots(), 16);
+        state.tables_done();
+        assert_eq!(state.pending_dynamic_slots(), 0);
+        // Idempotent second call (as `list::ran` does after `Detached::release_tables`).
+        state.tables_done();
+        assert_eq!(state.pending_dynamic_slots(), 0);
+    }
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
@@ -3313,7 +3340,7 @@ impl State {
             }
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_dispatch_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -4218,6 +4245,10 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
+                        if let Some((buffer, gpu)) = list.snapshot_placed_constants(address, size) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -4608,9 +4639,15 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let pipeline = self.pipeline as This;
+        let host = if kind == DISPATCH {
+            crate::pipeline::host_dispatch_pipeline(pipeline)
+        } else {
+            crate::pipeline::host_pipeline(pipeline)
+        };
+        let Some(p) = host else {
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(pipeline);
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256

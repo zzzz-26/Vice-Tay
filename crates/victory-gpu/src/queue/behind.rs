@@ -449,15 +449,18 @@ enum Job {
     Wait(FenceRef, u64),
     /// A part of a submission waits for a memory value.
     Value(crate::list::ValueWait),
-    /// A submission, or a part of one: the lists' host sides and the order
-    /// they run in.
-    Run(usize, Vec<crate::list::Detached>, Vec<usize>),
+    /// A submission, or a part of one: the lists' host sides, the order
+    /// they run in, and the heap-sync stamp captured at enqueue.
+    Run(usize, Vec<crate::list::Detached>, Vec<usize>, u64),
     /// A submission whose lists are being translated ([`crate::list::thin`]):
-    /// the parts of it are known when they are.
-    Lists(usize, Recordings),
+    /// the parts of it are known when they are. Carries the enqueue heap-sync
+    /// stamp so unfolded runs inherit it.
+    Lists(usize, Recordings, u64),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
-    /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(FenceRef, u64)>),
+    /// begin in the order, the signals given behind them, and the combined
+    /// heap-sync stamp (`merge_stamp`, where `0` dominates to force a fresh
+    /// round whenever any joined part is unstamped).
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(FenceRef, u64)>, u64),
     /// A signal of the queue's.
     Signal(FenceRef, u64),
     /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
@@ -486,7 +489,7 @@ impl Work for Job {
         match self {
             Job::Wait(fence, value) => Some(Ask::Wait(fence.clone(), *value)),
             Job::Value(wait) => Some(Ask::Value(*wait)),
-            Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
+            Job::Lists(_, lists, _) => Some(Ask::Lists(lists.clone())),
             _ => None,
         }
     }
@@ -496,11 +499,11 @@ impl Work for Job {
     }
 
     fn unfold(self) -> Vec<Self> {
-        let Job::Lists(queue, recordings) = self else {
+        let Job::Lists(queue, recordings, stamp) = self else {
             return vec![self];
         };
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
-        let jobs = jobs_of(queue as This, &lists);
+        let jobs = jobs_of(queue as This, &lists, stamp);
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
@@ -520,13 +523,21 @@ impl Work for Job {
     }
 
     fn mark_later() -> u64 {
-        // (Asked for now: the round runs while the lane does what is before
-        // the part behind the wait.)
-        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
+        // (Asked for now when `port_journal` is on: the round runs while the
+        // lane does what is before the part behind the wait. Otherwise capture
+        // the current `SyncRounds` stamp so any queued submission behind a
+        // fence or memory-value wait still waits for a round begun after the
+        // wait was met.)
+        if crate::port_journal::on() {
+            crate::descriptor::round_after_now()
+        } else {
+            crate::descriptor::heap_sync_stamp()
+        }
     }
 
     fn raises(&self) -> bool {
-        // (Without the switch no mark is taken: the memory is not read.)
+        // Without `port_journal`, treat every wait conservatively without
+        // re-reading title memory.
         if !crate::port_journal::on() {
             return true;
         }
@@ -537,7 +548,14 @@ impl Work for Job {
     }
 
     fn marked(&mut self, mark: u64) {
-        crate::port_journal::set_mark(mark);
+        if crate::port_journal::on() {
+            crate::port_journal::set_mark(mark);
+        } else if mark > 0 {
+            match self {
+                Job::Run(.., stamp) | Job::Joined(.., stamp) if *stamp > 0 => *stamp = (*stamp).max(mark),
+                _ => {}
+            }
+        }
     }
 
     fn met(ask: &Ask) -> bool {
@@ -568,8 +586,8 @@ impl Work for Job {
         }
         // Nothing but waits and signals that a submission may follow.
         let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+            Job::Run(_, lists, order, _) => (1, (&*lists, &*order), &[][..]),
+            Job::Joined(_, lists, order, parts, signals, _) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
             _ => {
                 note_join_stop(JoinStop::BoundaryJob);
                 return Err(next);
@@ -595,7 +613,7 @@ impl Work for Job {
                 }
             }
             Job::Signal(..) => {}
-            Job::Run(_, more, order) => {
+            Job::Run(_, more, order, _) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
                 let stop = if count >= most {
                     Some(JoinStop::PartLimit)
@@ -616,18 +634,19 @@ impl Work for Job {
         }
         // (A signal held in the line keeps its fence: no placeholder job
         // can stand in for this one while it is taken apart.)
-        if let Job::Run(queue, lists, order) = self {
-            *self = Job::Joined(*queue, std::mem::take(lists), std::mem::take(order), Vec::new(), Vec::new());
+        if let Job::Run(queue, lists, order, stamp) = self {
+            *self = Job::Joined(*queue, std::mem::take(lists), std::mem::take(order), Vec::new(), Vec::new(), *stamp);
         }
-        let Job::Joined(_, lists, order, parts, signals) = self else {
+        let Job::Joined(_, lists, order, parts, signals, stamp) = self else {
             return Err(next);
         };
         let run = matches!(next, Job::Run(..));
         match next {
-            Job::Run(_, more, then) => {
+            Job::Run(_, more, then, next_stamp) => {
                 parts.push(order.len());
                 order.extend(then.into_iter().map(|i| i + lists.len()));
                 lists.extend(more);
+                *stamp = merge_stamp(*stamp, next_stamp);
                 STATS[JOINED].fetch_add(1, Relaxed);
             }
             Job::Signal(fence, value) => signals.push((fence, value)),
@@ -655,24 +674,24 @@ impl Work for Job {
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
-            Job::Run(queue, lists, order) => {
+            Job::Run(queue, lists, order, stamp) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
                 match crate::host::host() {
-                    Some(host) => host.execute_late(lists, order),
+                    Some(host) => host.execute_parts_stamped(lists, order, &[], (stamp > 0).then_some(stamp)),
                     None => drop(lists),
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
-            Job::Joined(queue, lists, order, parts, signals) => {
+            Job::Joined(queue, lists, order, parts, signals, stamp) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
                 });
                 match crate::host::host() {
-                    Some(host) => host.execute_parts(lists, order, &parts),
+                    Some(host) => host.execute_parts_stamped(lists, order, &parts, (stamp > 0).then_some(stamp)),
                     None => drop(lists),
                 }
                 // (A part that had no list is one all the same.)
@@ -883,6 +902,7 @@ pub(super) fn wait_before_framegen() {
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
     let queue = this as usize;
+    let stamp = crate::descriptor::heap_sync_stamp();
     if crate::list::thin::on() {
         let recordings = crate::list::thin::submitted(lists);
         if recordings.is_empty() {
@@ -891,11 +911,11 @@ pub(super) fn submit(this: This, lists: &[This]) {
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
         STATS[DEEPEST].fetch_max(before + 1, Relaxed);
-        LANE.push(queue, [Job::Lists(queue, recordings)]);
+        LANE.push(queue, [Job::Lists(queue, recordings, stamp)]);
         room(before + 1);
         return;
     }
-    let jobs = jobs_of(this, lists);
+    let jobs = jobs_of(this, lists, stamp);
     let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
     let before = QUEUED.fetch_add(runs, Relaxed);
     STATS[RUNS].fetch_add(runs, Relaxed);
@@ -915,8 +935,15 @@ fn room(queued: u64) {
     }
 }
 
+/// Combines enqueue heap-sync stamps when joining two submissions: `0` means
+/// unstamped (must request a fresh round at preparation) and dominates any
+/// stamped part.
+fn merge_stamp(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 { 0 } else { a.max(b) }
+}
+
 /// What a submission of `lists` is in the line.
-fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
+fn jobs_of(this: This, lists: &[This], stamp: u64) -> Vec<Job> {
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
@@ -938,12 +965,19 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     let mut jobs: Vec<Job> = Vec::new();
     if first > 0 {
         let (taken, order) = crate::list::detach(&lists[..first]);
-        jobs.push(Job::Run(queue, taken, order));
+        jobs.push(Job::Run(queue, taken, order, stamp));
     }
     if first < lists.len() {
+        // Parts behind a memory-value wait may depend on descriptor records
+        // written after `submit` (before that wait is met), so they and every
+        // subsequent part stay unstamped (`0` -> fresh round at preparation).
+        let mut after_wait = false;
         for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
+            if !waits.is_empty() {
+                after_wait = true;
+            }
             jobs.extend(waits.into_iter().map(Job::Value));
-            jobs.push(Job::Run(queue, taken, order));
+            jobs.push(Job::Run(queue, taken, order, if after_wait { 0 } else { stamp }));
         }
     }
     jobs
@@ -1315,5 +1349,14 @@ mod tests {
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn merge_stamp_preserves_unstamped_parts() {
+        assert_eq!(merge_stamp(3, 5), 5);
+        assert_eq!(merge_stamp(7, 2), 7);
+        assert_eq!(merge_stamp(0, 5), 0);
+        assert_eq!(merge_stamp(5, 0), 0);
+        assert_eq!(merge_stamp(0, 0), 0);
     }
 }

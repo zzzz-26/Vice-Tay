@@ -14,6 +14,7 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
+    NTSTATUS,
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -498,20 +499,25 @@ pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     unsafe { report("unhandled exception", info, true) };
 }
 
-/// The bytes at `at` as hex, as many as the longest x86 instruction (15),
-/// but none past the end of `at`'s page: the next page may not be mapped.
-/// For an instruction the CPU refused, they name it (`0f 01 fd` is
-/// `rdpru`), which the address alone does not.
-///
-/// # Safety
-/// `at`'s page is readable.
-unsafe fn instruction_bytes(at: usize) -> String {
+/// Read at most 15 bytes from the faulting page. The page can become
+/// unreadable before the exception report is written.
+fn instruction_bytes(at: usize) -> Option<String> {
     let n = (0x1000 - (at & 0xfff)).min(15);
-    // SAFETY: `n` bytes from `at` stay inside its page, which the caller
-    // says is readable.
-    let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, n) };
-    let hex: Vec<_> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    hex.join(" ")
+    let mut bytes = [0; 15];
+    if !read_memory(at as u64, &mut bytes[..n]) {
+        return None;
+    }
+    let hex: Vec<_> = bytes[..n].iter().map(|b| format!("{b:02x}")).collect();
+    Some(hex.join(" "))
+}
+
+/// Label any instruction bytes available for this exception.
+fn faulting_instruction_label(code: NTSTATUS) -> Option<&'static str> {
+    match code {
+        EXCEPTION_ILLEGAL_INSTRUCTION | EXCEPTION_PRIV_INSTRUCTION => Some("code"),
+        EXCEPTION_BREAKPOINT => Some("breakpoint"),
+        _ => None,
+    }
 }
 
 /// MSVC's code for a C++ `throw`, and its magic first parameter.
@@ -575,9 +581,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
         // SAFETY: a live MSVC throw.
         format!(" (C++ {} thrown)", unsafe { thrown(&p) })
-    } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
-        // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
-        format!(" (code {})", unsafe { instruction_bytes(at) })
+    } else if let Some(label) = faulting_instruction_label(code)
+        && let Some(bytes) = instruction_bytes(at)
+    {
+        format!(" ({label} {bytes})")
     } else {
         String::new()
     };
@@ -1890,11 +1897,35 @@ mod tests {
             assert_ne!(VirtualProtect(guard, 0x1000, PAGE_NOACCESS, &mut old), 0);
             page.copy_from_nonoverlapping(code.as_ptr(), code.len());
             let whole = "0f 01 fd 48 89 c1 90 90 90 90 90 90 90 90 90";
-            assert_eq!(instruction_bytes(page as usize), whole);
+            assert_eq!(instruction_bytes(page as usize).as_deref(), Some(whole));
             // The page's last three bytes: rdpru, and nothing read after it.
             let end = page.add(0x1000 - 3);
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
-            assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
+            assert_eq!(instruction_bytes(end as usize).as_deref(), Some("0f 01 fd"));
+            assert!(instruction_bytes(guard as usize).is_none());
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn a_breakpoint_is_reported_with_its_bytes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // A breakpoint shows the faulting bytes like an illegal instruction,
+        // under its own label; other codes carry no instruction bytes.
+        assert_eq!(faulting_instruction_label(EXCEPTION_BREAKPOINT), Some("breakpoint"));
+        assert_eq!(faulting_instruction_label(EXCEPTION_ILLEGAL_INSTRUCTION), Some("code"));
+        assert_eq!(faulting_instruction_label(EXCEPTION_PRIV_INSTRUCTION), Some("code"));
+        assert_eq!(faulting_instruction_label(EXCEPTION_ACCESS_VIOLATION), None);
+        // A title's own `int3` (0xcc) reads back as the trap it executed.
+        // SAFETY: a fresh page of ours, read only within it.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                .cast::<u8>();
+            assert!(!page.is_null());
+            page.write_bytes(0xcc, 1);
+            assert!(instruction_bytes(page as usize).is_some_and(|bytes| bytes.starts_with("cc")));
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }

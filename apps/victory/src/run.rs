@@ -104,8 +104,8 @@ fn series_s_upscaler(
         ) {
             Ok(()) => {
                 if let Some(dir) = fsr_dir {
-                    match fidelityfx::use_host_fsr3(dir, quality) {
-                        Ok(()) => tracing::info!("Series S DLSS: AMD FSR 3.1.6 stands by"),
+                    match fidelityfx::use_host_fsr_series_s(dir, quality) {
+                        Ok(version) => tracing::info!(version, "Series S DLSS: AMD FSR stands by"),
                         Err(error) => tracing::warn!(%error, "Series S DLSS: FSR fallback unavailable"),
                     }
                 }
@@ -121,10 +121,10 @@ fn series_s_upscaler(
     let dir = fsr_dir.context(
         "VICTORY_FSR requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
     )?;
-    fidelityfx::use_host_fsr3(dir, quality)
+    let version = fidelityfx::use_host_fsr_series_s(dir, quality)
         .map_err(anyhow::Error::msg)
         .context("initializing FSR for Series S")?;
-    tracing::info!(preset = preset.name(), "Series S: AMD FSR 3.1.6 selected");
+    tracing::info!(preset = preset.name(), version, "Series S: AMD FSR selected");
     Ok(())
 }
 
@@ -170,8 +170,10 @@ pub fn run(
             "choose either VICTORY_FSR or VICTORY_DLSS"
         );
         anyhow::ensure!(
-            std::env::var_os("VICTORY_FFX_SCALE").is_none() && std::env::var_os("VICTORY_UPSCALER").is_none(),
-            "the Series S upscaler preset sets the scale and upscaler. Clear VICTORY_FFX_SCALE and VICTORY_UPSCALER."
+            ["VICTORY_FFX_SCALE", "VICTORY_RENDER_SCALE", "VICTORY_UPSCALER"]
+                .into_iter()
+                .all(|name| std::env::var_os(name).is_none()),
+            "the Series S upscaler preset sets the scale and upscaler. Clear VICTORY_FFX_SCALE, VICTORY_RENDER_SCALE and VICTORY_UPSCALER."
         );
     }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
@@ -417,7 +419,7 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
-    victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
+    victory_loader::set_before_thread_shutdown(last_saves);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -438,9 +440,17 @@ pub fn run(
     let code = main.join();
     victory_hle::modules::fidelityfx::shut_down();
     let code = code.map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    victory_hle::known_pipelines::flush();
+    last_saves();
     println!("title exited with {code}");
     Ok(())
+}
+
+/// What is put on disk when the title exits, while the layer's threads can
+/// still work: the pipelines it is known to make, and the capture pictures
+/// still in the line of the thread that writes them.
+fn last_saves() {
+    victory_hle::known_pipelines::flush();
+    victory_hle::finish_captures();
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

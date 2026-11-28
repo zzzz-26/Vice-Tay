@@ -25,6 +25,57 @@ counts sums process-wide changes sampled during list creation. Concurrent
 calls can overlap, and other threads can allocate or free memory in the same
 intervals. Measure allocator cost in a separate run.
 
+## Series S 4K boat test
+
+On November 27, 2026, I repeated a 40-second boat sequence from the same
+checkpoint on the RTX 4090 (driver 621.40) and Ryzen 9 9950X3D. Each run
+used the Series S profile with DLSS Quality (2560 × 1440 → 3840 × 2160),
+AMD FSR 3.1.6 frame generation at 2×, the frame rate unlocked and the
+performance overlay visible. Both runs started with the same shader and
+pipeline cache seed and loaded the same local BCPack format tables. After
+the objective appeared, the sequence turned the camera in both directions
+and accelerated for four seconds.
+
+| Local build | Intervals | Sample time | Rendered frames | Generated frames | Presented frames | Mean time per rendered frame |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4K reference · `e9a30f4f` | 38 | 39.26 s | 633 | 633 | 1,266 | 62.02 ms |
+| 4K experimental · `424fb3f6` | 38 | 38.73 s | 1,035 | 1,035 | 2,070 | 37.43 ms |
+
+| Local build | Rendered FPS | Generated FPS | Presented FPS | Rendered P10 | Rendered median | Rendered P90 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4K reference | 16.12 | 16.12 | 32.25 | 13.98 | 16.68 | 17.17 |
+| 4K experimental | 26.72 | 26.72 | 53.44 | 23.48 | 27.80 | 28.50 |
+
+Average FPS divides the frame counts by the total time of the intervals
+that fall entirely within the measured sequence. The percentiles and
+median use the individual intervals, each about one second long.
+
+The reference adds local 4K support to `01482583`. The experimental build
+adds texture and descriptor changes, starts placing buffers on the card
+at 64 KiB, uses GPU-placed constants, and sets a 4 GiB Resizable BAR
+window pool. The result measures the combined configuration on this route.
+The proposed launcher and the texture changes are tracked separately in
+[PR #329](https://github.com/TaynanGT/Vice-Tay/pull/329) and
+[PR #370](https://github.com/TaynanGT/Vice-Tay/pull/370).
+
+## Series S 1080p GPU read-through
+
+On November 27, 2026, I switched GPU read-through for compatible fills
+on and off every five seconds in one diagnostic build, with the boat
+stationary and the camera fixed on the bridge. The RTX 4090 used DLSS
+Quality (1280 × 720 → 1920 × 1080) and AMD FSR 3.1.6 frame generation
+at 2×. The 115-second test yielded 11 complete phases and 33 telemetry
+intervals per setting after dropping the first second of each phase.
+
+| GPU read-through | Rendered FPS | Generated FPS | Presented FPS | Mean time per rendered frame |
+| --- | ---: | ---: | ---: | ---: |
+| Off | 22.60 | 22.60 | 45.13 | 44.25 ms |
+| On | 26.38 | 26.38 | 52.78 | 37.91 ms |
+
+All ten consecutive off-to-on pairs improved. The median reduction in
+frame time across those pairs was 6.45 ms. The change from Maxime Cambou
+is enabled in compatible NVIDIA profiles as of `01482583`. [PR #374](https://github.com/TaynanGT/Vice-Tay/pull/374)
+
 ## Series S frame generation
 
 On November 27, 2026, I measured a boat traversal on the RTX 4090 and Ryzen 9

@@ -335,7 +335,8 @@ fn requested_pipelines(dir: &Path, which: &[WarmRecipe<'_>]) -> io::Result<Vec<V
 
 /// Makes the selected host pipelines and lets each go again: the driver's
 /// cache on disk keeps them. `each` receives each recipe's index before
-/// compiling, and afterward with elapsed milliseconds and success.
+/// compiling, and afterward with elapsed milliseconds and success. Unreadable
+/// recipes return an error before reporting the start of compilation.
 pub fn make(
     dir: &Path, which: &[WarmRecipe<'_>], mut each: impl FnMut(usize, Option<(f64, bool)>),
 ) -> io::Result<()> {
@@ -353,11 +354,15 @@ pub fn make(
         Some(bytes)
     };
     for (recipe, entry) in which.iter().zip(&entries) {
-        each(recipe.index, None);
         let began = std::time::Instant::now();
-        let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
-            .is_some();
+        let (shaders, graphics) = parse(entry, &mut read).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("pipeline recipe {} ({}) or its shader data is incomplete or invalid", recipe.index, recipe.key),
+            )
+        })?;
+        each(recipe.index, None);
+        let made = HostPipeline::new(&shaders, graphics.as_deref()).is_some();
         each(recipe.index, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }
     Ok(())
@@ -652,6 +657,25 @@ mod tests {
         assert_eq!(requested_pipelines(dir.path(), &stale).unwrap_err().kind(), io::ErrorKind::InvalidData);
         stale[0].offset = (bytes.len() - 4) as u64;
         assert_eq!(requested_pipelines(dir.path(), &stale).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_missing_shader_keeps_the_pipeline_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entry = vec![0x12; 16];
+        entry.extend([1, 5]); // One compute shader.
+        entry.extend([0xab; 32]);
+        entry.push(0); // No graphics state.
+        let mut book = (entry.len() as u32).to_le_bytes().to_vec();
+        book.extend(entry);
+        std::fs::write(dir.path().join(PIPELINES), book).unwrap();
+        std::fs::write(dir.path().join(SHADERS), b"").unwrap();
+
+        let key = "12".repeat(16);
+        let which = [WarmRecipe { index: 0, offset: 0, key: &key }];
+        let error = make(dir.path(), &which, |_, _| panic!("an unreadable recipe reported progress")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(&key));
     }
 
     #[test]

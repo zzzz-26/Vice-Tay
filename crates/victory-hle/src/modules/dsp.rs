@@ -11,7 +11,9 @@
 //!
 //! With `VICTORY_DSP_CONVOLUTION=1`, the host decodes the partitioned impulse
 //! response and renders convolution streams. Other transforms and streams
-//! without a usable filter use the silent fallback.
+//! without a usable filter use the silent fallback. With
+//! `VICTORY_DSP_MONO_PASSTHROUGH=1`, the mono fallback copies readable input
+//! to the output at unity gain.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -37,6 +39,9 @@ const MAX_BLOCK_SAMPLES: usize = 0x800;
 
 static HOST_CONVOLUTION: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("VICTORY_DSP_CONVOLUTION").is_some_and(|value| value == "1"));
+static MONO_PASSTHROUGH: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("VICTORY_DSP_MONO_PASSTHROUGH").is_some_and(|value| value == "1")
+});
 
 pub struct Dsp {
     max_streams: u32,
@@ -290,6 +295,28 @@ fn write_convolution(stream: &mut Stream, command: &Command, samples: usize) -> 
     true
 }
 
+fn write_output(stream: &mut Stream, command: &Command, mono_passthrough: bool) {
+    if command.output.is_null() {
+        return;
+    }
+    let samples = (stream.frames * stream.channels) as usize;
+    if write_convolution(stream, command, samples) {
+        return;
+    }
+    if mono_passthrough && stream.channels == 1 {
+        // Stage one bounded block so the input may alias the output. On an
+        // unreadable source the partial read stays in this scratch buffer.
+        let mut input = [0.0f32; MAX_BLOCK_SAMPLES];
+        if read_samples(command.input, &mut input[..samples]) {
+            // SAFETY: the title's output buffer holds one block of the stream.
+            unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), command.output, samples) };
+            return;
+        }
+    }
+    // SAFETY: the title's output buffer holds one block of the stream.
+    unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+}
+
 /// Completes the command and publishes its status.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
@@ -301,13 +328,7 @@ pub extern "system" fn XDspSubmitCommand(
     }
     // SAFETY: a stream from `XDspActivate`, the title's command.
     let (stream, command) = unsafe { (&mut *stream, &*command) };
-    if !command.output.is_null() {
-        let samples = (stream.frames * stream.channels) as usize;
-        if !write_convolution(stream, command, samples) {
-            // SAFETY: the title's output buffer holds one block of the stream.
-            unsafe { std::ptr::write_bytes(command.output, 0, samples) };
-        }
-    }
+    write_output(stream, command, *MONO_PASSTHROUGH);
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
     // SAFETY: the status block is read by title code on other threads.
@@ -385,10 +406,56 @@ mod tests {
             output: samples.as_mut_ptr(),
             reserved: 0,
         };
-        assert!(write_convolution(&mut stream, &command, samples.len()));
+        write_output(&mut stream, &command, true);
         assert_eq!(samples, expected);
         desc.ir_floats = u32::MAX;
         assert!(make_convolver(&dsp, &desc).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mono_passthrough_uses_one_block_and_preserves_the_silent_fallback() {
+        let mut stream = Stream {
+            dsp: std::ptr::null_mut(),
+            frames: 0x200,
+            channels: 1,
+            status: Box::new(Status {
+                submitted: 0,
+                completed: 0,
+                reserved: 0,
+                result: S_OK,
+            }),
+            convolver: None,
+            deinterleaved: false,
+        };
+        let input = [0.25f32; 0x200];
+        let mut output = [1.0f32; 0x400];
+        let mut command = Command {
+            gains: [1.0; 2],
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            reserved: 0,
+        };
+        write_output(&mut stream, &command, true);
+        assert_eq!(&output[..0x200], &input);
+        assert!(output[0x200..].iter().all(|&sample| sample == 1.0));
+
+        command.input = output.as_ptr();
+        write_output(&mut stream, &command, true);
+        assert_eq!(&output[..0x200], &input);
+
+        write_output(&mut stream, &command, false);
+        assert!(output[..0x200].iter().all(|&sample| sample == 0.0));
+        output.fill(1.0);
+        command.input = std::ptr::null();
+        write_output(&mut stream, &command, true);
+        assert!(output[..0x200].iter().all(|&sample| sample == 0.0));
+
+        output.fill(1.0);
+        stream.channels = 2;
+        command.input = input.as_ptr();
+        write_output(&mut stream, &command, true);
+        assert!(output.iter().all(|&sample| sample == 0.0));
     }
 
     #[test]

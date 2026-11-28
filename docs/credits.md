@@ -10,7 +10,7 @@ VIctory is. The trees this one is built from are listed in the
 Everyone with a commit in this history, by number of commits (merge commits
 left out; `git shortlog -sn --no-merges` gives it for any revision):
 
-- avatarmanz (245, recorded as `local`)
+- avatarmanz (246, of which 245 are recorded as `local`)
 - Taynan Piza (27)
 - fxceless (17)
 - Duff (16)
@@ -25,10 +25,10 @@ left out; `git shortlog -sn --no-merges` gives it for any revision):
 - marquezini (7)
 - codec_d (6)
 - quaternion (6)
+- fuzeofficial (6)
 - 9hvn9yt2vk-netizen (5)
 - Enzo Souza Duarte (5)
 - FIocker (5)
-- fuzeofficial (5)
 - tedin7 (5)
 - EatCodeSleep2 (4)
 - LF2000 Builder (4)
@@ -89,7 +89,6 @@ left out; `git shortlog -sn --no-merges` gives it for any revision):
 - FictionHub (1)
 - Flare (1)
 - FrancescoGelosoEterea (1)
-- Fuzeofficial (1)
 - Giuseppe Rainone (1)
 - HailLucifer666 (1)
 - Jake (1)
@@ -115,7 +114,6 @@ left out; `git shortlog -sn --no-merges` gives it for any revision):
 - alessiodeia (1)
 - artor410 (1)
 - ashrafsdrop (1)
-- avatarmanz (1)
 - broccolize (1)
 - bvtterbroot (1)
 - cwWwWwW (1)

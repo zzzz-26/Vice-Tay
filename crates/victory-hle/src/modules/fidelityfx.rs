@@ -269,9 +269,15 @@ pub fn use_host_dir(dir: &Path) -> Result<&'static str, String> {
     use_host_version(dir, &[FSR4_VERSION, FSR3_VERSION], None)
 }
 
-/// Select FSR 3.1.6 with the Series S profile's requested quality mode.
-pub fn use_host_fsr3(dir: &Path, quality: u32) -> Result<(), String> {
-    use_host_version(dir, &[FSR3_VERSION], Some(quality)).map(|_| ())
+/// Select FSR with a fixed Series S quality mode. FSR 4 is opt-in and falls
+/// back to FSR 3.1.6 when the adapter does not offer it.
+pub fn use_host_fsr_series_s(dir: &Path, quality: u32) -> Result<&'static str, String> {
+    let versions: &[_] = if std::env::var_os("VICTORY_FSR4_SERIES_S").is_some_and(|value| value == "1") {
+        &[FSR4_VERSION, FSR3_VERSION]
+    } else {
+        &[FSR3_VERSION]
+    };
+    use_host_version(dir, versions, Some(quality))
 }
 
 fn use_host_version(

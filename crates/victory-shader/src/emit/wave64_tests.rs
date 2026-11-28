@@ -528,7 +528,7 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     // ... and the lowering names the block, around which that branch is the one to widen
     let needs = lower::take_needs();
     let st = structure::structure(&p).expect("structure");
-    assert_eq!(lower::branches_around(&st, &needs), Some(vec![branch]));
+    assert_eq!(lower::branches_around_with_loop_exits(&st, &needs, true), Some(vec![branch]));
     // (taken, past the body, when every lane's bit is clear)
     assert_eq!(st.wave_any[branch], Some(false));
     // wave-wide, every lane runs the reduction (EXEC stays a guard on what it does there)
@@ -701,6 +701,9 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+#[path = "wave64_after_loop.rs"]
+mod after_loop;
 
 /// A dispatch counted in threads: of the last group only the lanes below the
 /// count store (after DexNom/VIctory bc3cd4b0).

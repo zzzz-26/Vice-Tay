@@ -641,7 +641,22 @@ impl Memory {
         };
         self.hold(page, at, copy);
         crate::watch::wrote(self.entry(page) as usize, 8);
+        // Taken as of now: without the number a later [`Memory::bring`] took
+        // the page as never taken and sent all of title memory's bytes up
+        // again, over what the builder had made of them on the card (a
+        // structure unpacked there went back to its packed bytes, built
+        // nodes sharing the page to the title's bytes). (`VICTORY_PLACE_TAKEN=0`:
+        // as before.)
+        let now = place_taken()
+            .then(|| crate::watch::writes((page * PAGE) as usize, ((page + 1) * PAGE) as usize, true))
+            .flatten()
+            .map(|(now, _)| now);
         self.take(page, 0, PAGE as usize, true);
+        if let Some(now) = now
+            && let Some(held) = self.pages.get_mut(&page)
+        {
+            held.taken = now.max(1);
+        }
         true
     }
 
@@ -883,6 +898,12 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
         }
     }
     asked
+}
+
+/// Whether a page placed at submission remembers its write-watch stamp.
+fn place_taken() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACE_TAKEN").is_none_or(|v| v != "0"))
 }
 
 /// [`fill`] of a page stores by address do not reach.

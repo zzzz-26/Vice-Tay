@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result};
 
@@ -26,10 +28,13 @@ impl CacheKey {
     }
 }
 
+type PendingConversions = Mutex<HashMap<CacheKey, Weak<Mutex<()>>>>;
+
 /// Content-addressed store under the user's cache directory.
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
+    conversions: Arc<PendingConversions>,
 }
 
 impl Cache {
@@ -38,7 +43,7 @@ impl Cache {
         let root = root.into();
         victory_core::ensure_outside_repo(&root)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
-        Ok(Cache { root })
+        Ok(Cache { root, conversions: Arc::default() })
     }
 
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
@@ -54,6 +59,21 @@ impl Cache {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
+        let conversion = {
+            let mut running = self.conversions.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(conversion) = running.get(&key).and_then(Weak::upgrade) {
+                conversion
+            } else {
+                running.retain(|_, conversion| conversion.strong_count() != 0);
+                let conversion = Arc::new(Mutex::new(()));
+                running.insert(key, Arc::downgrade(&conversion));
+                conversion
+            }
+        };
+        let _in_progress = conversion.lock().unwrap_or_else(|error| error.into_inner());
+        if path.is_file() {
+            return Ok(path);
+        }
         let output = converter
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
@@ -64,10 +84,13 @@ impl Cache {
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(error) = published {
             let _ = std::fs::remove_file(&tmp);
+            // Another cache instance or process may already have published this key.
+            if !path.is_file() {
+                return Err(error.into());
+            }
         }
-        published?;
         Ok(path)
     }
 }
@@ -135,6 +158,43 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn concurrent_misses_for_one_key_share_a_conversion() {
+        struct SlowUpper(Upper);
+
+        impl Converter for SlowUpper {
+            fn id(&self) -> &'static str {
+                self.0.id()
+            }
+
+            fn version(&self) -> u32 {
+                self.0.version()
+            }
+
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                self.0.convert(input)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let converter = SlowUpper(Upper { version: 1, runs: AtomicUsize::new(0) });
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = cache.clone();
+                let (start, converter) = (&start, &converter);
+                scope.spawn(move || {
+                    start.wait();
+                    let path = cache.get_or_convert(converter, b"abc").unwrap();
+                    assert_eq!(std::fs::read(path).unwrap(), b"ABC");
+                });
+            }
+        });
+        assert_eq!(converter.0.runs.load(Ordering::Relaxed), 1);
     }
 
     #[test]

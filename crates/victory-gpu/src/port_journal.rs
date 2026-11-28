@@ -10,12 +10,13 @@
 //!
 //! - **The heaps' records** (this module; renderer patch #4's part 1,
 //!   `port/lane` 97033e5a, brought over): a round of the heap-sync thread is
-//!   asked for when the title submits ([`round_after`]), so it runs while
-//!   the submission waits in the line, and the lane waits for that round,
-//!   or for a later one if (a) a wait of its queue that was met in memory
-//!   went since (the queue's floor, `queue/behind.rs` `State::floors`) or (b)
-//!   a step of ours wrote, or may have written, a heap's title memory while
-//!   preparing ([`prep_wrote`]).
+//!   stamped when the title submits (`descriptor::heap_sync_stamp`), so it
+//!   can share a round that began while the submission waited in the line, and
+//!   the lane waits for that round, or for a later one if (a) a wait of its
+//!   queue that was met in memory went since (the queue's floor,
+//!   `queue/behind.rs` `State::floors`) or (b) a step or GPU landing wrote, or
+//!   may have written, a heap's title memory ([`prep_wrote`], which raises
+//!   `descriptor::SyncRounds`'s floor for both paths).
 //! - **The journal's lock** (`crate::watch`): the pages' notes are kept in
 //!   parts of their own, each with its own lock; noting an answer that
 //!   changes nothing of the standing asking takes the journal's lock
@@ -41,16 +42,6 @@ pub(crate) fn on() -> bool {
 
 // ---------------------------------------------------------------------------
 // The heaps' records: rounds asked for at the title's submit.
-
-/// With rounds `asked` asked for and `done` done (one runs at a time, in
-/// order; round `k` begins only once `k - 1` is done and `k` has been asked
-/// for): the number of a round that begins after now, and whether it has to
-/// be asked for (it is `asked + 1` then). A round asked for and not begun
-/// yet (`asked >= done + 2`: the one before it is not done) begins after
-/// now; with `asked == done + 1` round `asked` may be running already.
-pub(crate) fn round_after(asked: u64, done: u64) -> (u64, bool) {
-    if asked >= done + 2 { (asked, false) } else { (asked + 1, true) }
-}
 
 thread_local! {
     /// On the lane: the round of the heaps' records the submission being
@@ -158,67 +149,4 @@ pub(crate) fn line(frames: f64) {
         s[PREP_WRITES] / f,
         journal.per_frame(f),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A round asked for and not begun is one that begins after now; one
-    /// that may be running is not.
-    #[test]
-    fn a_round_is_one_that_begins_after_now() {
-        // Nothing asked: ask for round 1.
-        assert_eq!(round_after(0, 0), (1, true));
-        // Round 3 asked for, 2 done: 3 may be running, ask for 4.
-        assert_eq!(round_after(3, 2), (4, true));
-        // Rounds up to 5 asked for, 2 done: 3 runs or waits, 5 cannot have
-        // begun.
-        assert_eq!(round_after(5, 2), (5, false));
-        assert_eq!(round_after(4, 2), (4, false));
-        // Everything done: ask anew.
-        assert_eq!(round_after(7, 7), (8, true));
-    }
-
-    /// A simulation of the rounds' thread: whatever the times of asking,
-    /// the round a caller is given begins after its call.
-    #[test]
-    fn the_round_given_begins_after_the_call() {
-        let (mut asked, mut done) = (0u64, 0u64);
-        // When each round began (in calls), and each caller's (call, round).
-        let mut began: std::collections::HashMap<u64, u64> = Default::default();
-        let mut given: Vec<(u64, u64)> = Vec::new();
-        let mut running: Option<u64> = None;
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        for call in 1..5000u64 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            match seed % 3 {
-                0 => {
-                    let (round, ask) = round_after(asked, done);
-                    if ask {
-                        asked += 1;
-                    }
-                    given.push((call, round));
-                }
-                1 => {
-                    if let Some(r) = running.take() {
-                        done = r;
-                    }
-                }
-                _ => {
-                    if running.is_none() && asked > done {
-                        running = Some(done + 1);
-                        began.insert(done + 1, call);
-                    }
-                }
-            }
-        }
-        for (call, round) in given {
-            if let Some(&at) = began.get(&round) {
-                assert!(at > call, "round {round} began at {at}, before the call at {call}");
-            }
-        }
-    }
 }

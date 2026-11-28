@@ -7,6 +7,20 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
+/// Pretranslation and its completion marker must see the same regular files.
+/// Resolve an explicitly supplied link, but do not follow links inside a root.
+pub(crate) fn precompile_entries(root: &Path, shader_cache: &Path) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    let cache = shader_cache.canonicalize().unwrap_or_else(|_| shader_cache.to_owned());
+    // A cache below the input can also hold new pipelines, images and logs.
+    // If the game directory doubles as the cache root, exclude just its shaders.
+    let exclude = match cache.parent() {
+        Some(parent) if parent != root && parent.starts_with(&root) => parent.to_owned(),
+        _ => cache,
+    };
+    WalkDir::new(root).sort_by_file_name().into_iter().filter_entry(move |entry| entry.path() != exclude)
+}
+
 pub(crate) struct FileScan {
     limit: u64,
     verbose: bool,
@@ -31,7 +45,15 @@ impl FileScan {
     }
 
     pub(crate) fn files(&mut self, root: &Path) -> impl Iterator<Item = (PathBuf, Vec<u8>)> {
-        WalkDir::new(root).into_iter().filter_map(move |entry| {
+        self.read_entries(root, WalkDir::new(root))
+    }
+
+    pub(crate) fn read_entries(
+        &mut self,
+        root: &Path,
+        entries: impl IntoIterator<Item = walkdir::Result<walkdir::DirEntry>>,
+    ) -> impl Iterator<Item = (PathBuf, Vec<u8>)> {
+        entries.into_iter().filter_map(move |entry| {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -47,6 +69,10 @@ impl FileScan {
             let data = self.read_file(entry.path(), entry.metadata().map_err(io::Error::from))?;
             Some((entry.into_path(), data))
         })
+    }
+
+    pub(crate) fn had_io_errors(&self) -> bool {
+        self.walk_errors + self.metadata_errors + self.read_errors != 0
     }
 
     fn read_file(&mut self, path: &Path, metadata: io::Result<fs::Metadata>) -> Option<Vec<u8>> {

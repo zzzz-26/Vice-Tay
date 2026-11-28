@@ -164,6 +164,12 @@ pub(crate) struct Geometry {
 /// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`view_heap_limit`].
+    pub(crate) static VIEW_LIMIT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
@@ -171,6 +177,10 @@ pub fn set_view_heap_limit(null_slot: u32) {
 
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = VIEW_LIMIT_HERE.get() {
+        return n;
+    }
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -516,9 +526,37 @@ impl Shader {
         props: (u32, u32),
         bounded: bool,
     ) -> V {
+        self.nonuniform_handles += u32::from(nonuniform);
+        self.marked_heap_handle_at(block, index, sampler, nonuniform, props, bounded)
+    }
+
+    /// The handle a buffer's size is asked through (`descriptor_data`):
+    /// marked non-uniform for AMD's RDNA4 compiler (`amdxc64.dll+0x861b9f`),
+    /// which reads a null pointer compiling `getDimensions` through the
+    /// uniform heap handle the buffer's loads use, and not counted in
+    /// `nonuniform_handles`, its index being the same in every lane.
+    pub fn size_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        props: (u32, u32),
+        bounded: bool,
+    ) -> V {
+        self.marked_heap_handle_at(block, index, false, true, props, bounded)
+    }
+
+    fn marked_heap_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        bounded: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         // (the raw twins of buffer views lie past it: such an index comes bounded)
-        let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
+        let limit = if bounded { 0 } else { view_heap_limit() };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -545,7 +583,6 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,

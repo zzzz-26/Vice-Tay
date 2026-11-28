@@ -941,6 +941,16 @@ extern "system" fn present(
     if !behind::on() {
         release_held(forces());
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let drained_for_trace = {
+        let next = presented() + 1;
+        if crate::capture::trace_boundary(next) {
+            before_sync();
+            Some(next)
+        } else {
+            None
+        }
+    };
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     let token = if planes > 0 {
@@ -981,7 +991,9 @@ extern "system" fn present(
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
-            before_sync();
+            if drained_for_trace != Some(frame) {
+                before_sync();
+            }
             crate::capture::dump_targets(frame);
         }
     }

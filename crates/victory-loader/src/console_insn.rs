@@ -2,8 +2,9 @@
 //! code raises STATUS_ILLEGAL_INSTRUCTION on them (the title zeroes memory with a `clzero` loop at
 //! its first frames), and the vectored handler steps over them here.
 //!
-//! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
-//! `console_insn_decode.rs`, unchanged) and `eh.rs` `emulate_console_only`.
+//! The instruction decoder and initial exception emulation were adapted from
+//! XCL's `insn.rs` and `eh.rs`. XCL publishes that source under GPL-3.0-or-later
+//! as of <https://github.com/xcl-dev/xcl/commit/06f90c1986f43698d0405eff3c2ab0af230e1ed9>.
 
 #[path = "console_insn_decode.rs"]
 mod decode;

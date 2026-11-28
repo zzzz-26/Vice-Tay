@@ -654,4 +654,7 @@ fn dlss_runs_the_titles_upscaler() {
         eprintln!("standby provider after DLSS refused dispatches: {active}");
     }
     assert_eq!(destroy(&mut context, null()), 0);
+    // Exercise NGX teardown and verify repeated shutdown idempotence.
+    victory_hle::modules::fidelityfx::shut_down();
+    victory_hle::modules::fidelityfx::shut_down();
 }

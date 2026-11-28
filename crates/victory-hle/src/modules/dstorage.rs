@@ -1512,10 +1512,11 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     }
 }
 
-/// The tables VIctory ships with.
 #[cfg(not(test))]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
+    let path = std::env::var_os("VICTORY_BCPACK_TABLES")
+        .ok_or("set VICTORY_BCPACK_TABLES to the path of your local BCPack format tables")?;
+    read_bcpack_tables(std::path::Path::new(&path))
 }
 
 /// Tests decode streams made against tables of their own, from this folder.
@@ -1530,8 +1531,12 @@ fn use_bcpack_tables(dir: std::path::PathBuf) {
 #[cfg(test)]
 fn load_bcpack_tables() -> Result<Tables, String> {
     let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
-    let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
-    Tables::parse(&bytes).map_err(|e| e.to_string())
+    read_bcpack_tables(&dir.join("tables.bin"))
+}
+
+fn read_bcpack_tables(path: &std::path::Path) -> Result<Tables, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read BCPack tables: {e}"))?;
+    Tables::parse(&bytes).map_err(|e| format!("invalid BCPack tables: {e}"))
 }
 
 /// A compressed request's source: borrowed from memory, or read from the

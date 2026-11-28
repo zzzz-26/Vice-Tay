@@ -54,17 +54,8 @@ run() {
     fi
 }
 
-# Pretranslate shaders on first run, as play.ps1 does (it resumes from cache).
-CACHE=$(run config 2>/dev/null | awk '/^cache_dir/{print $3}' | tr -d '\r')
-# ponytail: Z: (host /) and C: (the prefix) only; other drive letters skip the check.
-case "$CACHE" in
-  [Zz]:*) CACHE=${CACHE:2} ;;
-  [Cc]:*) CACHE=$WINEPREFIX/drive_c${CACHE:2} ;;
-  *) CACHE= ;;
-esac
-CACHE=${CACHE//\\//}
-[ "$(find "${CACHE:-/nonexistent}" -type f -regextype egrep -regex '.*/[0-9a-f]{62}' 2>/dev/null | head -1000 | wc -l)" -ge 1000 ] \
-  || run shaders || echo "shader pretranslation failed; continuing"
+# The executable checks pretranslation against its shader cache key.
+run shaders --if-needed || echo "shader pretranslation failed; continuing"
 # Every run's output is kept in $VH/last-run.log (previous one: .1).
 LOG=$VH/last-run.log
 [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"

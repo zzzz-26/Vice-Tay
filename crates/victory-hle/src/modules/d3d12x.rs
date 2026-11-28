@@ -4,6 +4,7 @@
 
 use std::ffi::c_void;
 
+pub use victory_gpu::Precompiled;
 use victory_gpu::device;
 use victory_gpu::object::{HRESULT, Iid, Object};
 
@@ -39,8 +40,9 @@ fn host_gpu_failed(what: &str) -> ! {
 }
 
 /// Translates `container` into the cache ([`use_shader_cache`]) ahead of
-/// any run: whether it was there already, or why it does not translate.
-pub fn precompile(container: &[u8]) -> Result<bool, String> {
+/// any run: whether it was there already or could not be kept, or why it
+/// does not translate.
+pub fn precompile(container: &[u8]) -> Result<Precompiled, String> {
     #[cfg(windows)]
     {
         victory_gpu::shader_cache::precompile(container)
@@ -50,6 +52,14 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
         let _ = container;
         Err("no host".into())
     }
+}
+
+/// Cache identity for shader pretranslation on this host.
+pub fn precompile_cache_key() -> Option<[u8; 32]> {
+    #[cfg(windows)]
+    { victory_gpu::shader_cache::precompile_cache_key() }
+    #[cfg(not(windows))]
+    { None }
 }
 
 /// Of the cached translations met since the start: those an earlier build
@@ -63,20 +73,6 @@ pub fn stale_shaders() -> (u64, u64, u64) {
     #[cfg(not(windows))]
     {
         (0, 0, 0)
-    }
-}
-
-/// The fork's offline warm-up (`victory translate --warm`), by
-/// [`precompile`]: whether it was translated now.
-pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
-    #[cfg(windows)]
-    {
-        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = container;
-        Err("no shader cache on this host".into())
     }
 }
 

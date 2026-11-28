@@ -1,8 +1,6 @@
-//! XStore as an offline console answers it: the game's own licence is
-//! local and active (a full, owned game); the user owns no add-ons; what
-//! needs the store service (catalog, consumables, purchase and update
-//! pages, collection ids, update checks) fails with the documented store
-//! network error.
+//! Offline XStore implementation. Game and package licences are inactive
+//! without verified entitlements. Calls that need the store service fail
+//! with the documented store network error.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -48,12 +46,9 @@ pub const NETWORK_ERROR: HRESULT = 0x8924_5301_u32 as i32;
 type This = *const Object;
 type Handle = *const c_void;
 
-/// Contexts and product queries hold nothing (queries are always empty),
-/// so their handles are fixed addresses. A licence handle says whether it
-/// is valid by which address it is.
+/// Contexts, empty product queries and inactive licences have fixed handles.
 static CONTEXT: u8 = 0;
 static QUERY: u8 = 0;
-static VALID: u8 = 0;
 static INVALID: u8 = 0;
 fn handle(of: &'static u8) -> Handle {
     (of as *const u8).cast()
@@ -123,25 +118,21 @@ extern "system" fn next_page_async(_: This, _: Handle, block: *mut AsyncBlock) -
     xasync::finished(block, (&raw const QUERY_CALL).cast(), E_ILLEGAL_METHOD_CALL)
 }
 
-fn license_for(owned: bool, block: *mut AsyncBlock) -> HRESULT {
-    let license = handle(if owned { &VALID } else { &INVALID });
+fn inactive_license(block: *mut AsyncBlock) -> HRESULT {
     xasync::finished_with(
         block,
         (&raw const LICENSE_CALL).cast(),
-        Ok(xasync::bytes(license)),
+        Ok(xasync::bytes(handle(&INVALID))),
     )
 }
-/// Only the game's own package is installed, so only its licence is valid.
 extern "system" fn license_for_package_async(
     _: This,
     _: Handle,
-    package: *const c_char,
+    _: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let ours = text(package).is_some_and(|p| p == xpackage::identifier());
-    license_for(ours, block)
+    inactive_license(block)
 }
-/// The user owns no durables: their licences are not valid.
 extern "system" fn license_for_durables_async(
     _: This,
     _: Handle,
@@ -150,15 +141,15 @@ extern "system" fn license_for_durables_async(
 ) -> HRESULT {
     tracing::debug!(
         store_id = text(store_id).unwrap_or_default(),
-        "durable not owned"
+        "durable entitlement unverified"
     );
-    license_for(false, block)
+    inactive_license(block)
 }
 extern "system" fn license_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
     xasync::result(block, (&raw const LICENSE_CALL).cast(), out)
 }
-extern "system" fn is_license_valid(_: This, license: Handle) -> bool {
-    license == handle(&VALID)
+extern "system" fn is_license_valid(_: This, _: Handle) -> bool {
+    false
 }
 
 /// The game licence, as the public API lays it out.
@@ -175,8 +166,7 @@ pub struct GameLicense {
     pub expiration: i64,
 }
 
-/// A full, active licence for the game's SKU (`<store id>/0010`, the
-/// store's first SKU), not a trial, without expiry.
+/// Report the game's SKU with an inactive licence until ownership can be verified.
 fn game_license() -> GameLicense {
     let mut sku = [0u8; 18];
     let id = format!("{}/0010", runtime::title().store_id);
@@ -184,7 +174,7 @@ fn game_license() -> GameLicense {
     sku[..len].copy_from_slice(&id.as_bytes()[..len]);
     GameLicense {
         sku_store_id: sku,
-        is_active: true,
+        is_active: false,
         is_trial_owned_by_this_user: false,
         is_disc_license: false,
         is_trial: false,
@@ -555,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn the_game_is_licensed_and_the_store_is_offline() {
+    fn unverified_game_and_package_licences_are_inactive() {
         let this: This = &OBJECT;
         assert_eq!(size_of::<GameLicense>(), 104);
         type Begin = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
@@ -573,7 +563,7 @@ mod tests {
         );
         // SAFETY: written by the call.
         let license = unsafe { license.assume_init() };
-        assert!(license.is_active && !license.is_trial);
+        assert!(!license.is_active);
 
         let mut b = block();
         assert_eq!(
@@ -587,23 +577,28 @@ mod tests {
             NETWORK_ERROR
         );
 
-        type Durable = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type AcquireLicense =
+            extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
         type License = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
-        let mut b = block();
-        let durable = method::<Durable>(&OBJECT, 0x238);
-        assert_eq!(
-            durable(this, handle(&CONTEXT), c"9XYZ".as_ptr(), &mut b),
-            S_OK
-        );
-        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
-        let mut l = std::ptr::null();
-        assert_eq!(
-            method::<License>(&OBJECT, 0x240)(this, &mut b, &mut l),
-            S_OK
-        );
-        assert!(!method::<extern "system" fn(This, Handle) -> bool>(
-            &OBJECT, 0xb0
-        )(this, l));
+        let package = std::ffi::CString::new(xpackage::identifier()).unwrap();
+        let is_valid = method::<extern "system" fn(This, Handle) -> bool>(&OBJECT, 0xb0);
+        for (begin, result, identifier) in
+            [(0xa0, 0xa8, package.as_c_str()), (0x238, 0x240, c"9XYZ")]
+        {
+            let mut b = block();
+            let acquire = method::<AcquireLicense>(&OBJECT, begin);
+            assert_eq!(
+                acquire(this, handle(&CONTEXT), identifier.as_ptr(), &mut b),
+                S_OK
+            );
+            assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+            let mut license = std::ptr::null();
+            assert_eq!(
+                method::<License>(&OBJECT, result)(this, &mut b, &mut license),
+                S_OK
+            );
+            assert!(!is_valid(this, license));
+        }
     }
 
     #[test]

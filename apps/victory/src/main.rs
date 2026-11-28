@@ -112,6 +112,9 @@ enum Command {
     /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
     Shaders {
         paths: Vec<PathBuf>,
+        /// Skip the scan if these paths have already been translated for this cache key.
+        #[arg(long, conflicts_with = "list")]
+        if_needed: bool,
         /// Worker threads (default: every logical core).
         #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
@@ -124,15 +127,22 @@ enum Command {
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
     /// driver's cache on disk has them before a run needs one: once per change
     /// of the translator or the driver. Goes on where it was stopped.
+    /// `VICTORY_WARM_BAD=0` ignores the quarantine in `warm-bad.txt`.
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
         #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
+        /// Pipelines per process (default: 40). Keep batches within the Windows command-line limit.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+        batch_size: Option<u16>,
+        /// Use normal Windows priority for the workers (default: idle).
+        #[arg(long)]
+        normal_priority: bool,
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Those made before too.
+        /// Retry completed and quarantined pipelines too.
         #[arg(long)]
         again: bool,
         /// Only the pipelines earlier runs drew with.
@@ -189,6 +199,14 @@ fn parse_jobs(value: &str) -> Result<usize, &'static str> {
         .map_err(|_| "expected a worker count of 1 or more")
 }
 
+fn requested_host_wave() -> Option<u32> {
+    translate::host_wave::select(
+        std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
+        std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
+        |message| eprintln!("{message}"),
+    )
+}
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -228,19 +246,17 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            let wave = translate::host_wave::select(
-                std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
-                std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
-                |message| eprintln!("{message}"),
-            );
+            let wave = requested_host_wave();
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs, wave);
             }
             translate::run(paths, validate, pipelines, list, jobs, wave)
         }
-        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        Command::Shaders { paths, jobs, list, if_needed } => translate::precompile(paths, jobs, list, if_needed),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, batch_size, normal_priority, limit, again, used, these } => {
+            warm::run(jobs, batch_size, normal_priority, limit, again, used, these)
+        }
         Command::Run {
             exe,
             unimplemented,

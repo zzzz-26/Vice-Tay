@@ -14,7 +14,8 @@ pub mod opt;
 pub(crate) struct Ty(u32);
 
 /// What the lowering made an instruction for, where it says so (counted by
-/// [`census`], nothing else reads it).
+/// [`census`]; [`Tag::Clamp`] is also read by [`opt`] to keep per-handle index
+/// clamps separate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tag {
     /// The select that keeps a register's old value in lanes a guard masks.
@@ -108,6 +109,9 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    /// 32- to 64-bit float: a plain double operation, unlike the integer conversions to
+    /// doubles (which need the double extensions flag).
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -226,6 +230,10 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Float results that must be the console's bit for bit (the ordered paired FP32
+    /// reductions, fxceless e3307c77). This line writes no fast-math flags, so it only marks
+    /// such a program.
+    pub exact_floats: bool,
 }
 
 impl Module {
@@ -377,10 +385,11 @@ impl Module {
     }
 
     /// Notes what instruction `v` is for (see [`Tag`]); only when modules
-    /// are counted.
+    /// are counted, except clamps, which the clean-up keeps one per handle
+    /// ([`opt::REUSE`]).
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && census::enabled()
+            && (tag == Tag::Clamp || census::enabled())
         {
             self.tags.insert(i, tag);
         }
